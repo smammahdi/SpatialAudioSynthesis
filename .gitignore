@@ -41,12 +41,14 @@ yarn-error.log*
 # React build files (we'll keep the build directory but could exclude it if needed)
 # frontend/build/
 
-# Environment variables
+# Environment variables (keep config.env as it contains non-sensitive config)
 .env
 .env.local
 .env.development.local
 .env.test.local
 .env.production.local
+*.env
+!config.env
 
 # IDE
 .vscode/
@@ -69,6 +71,20 @@ backend/custom_audio/*.mp3
 backend/custom_audio/*.wav
 backend/test_upload.wav
 backend/test.mp3
+*.tmp
+*.temp
+
+# Large binary files that shouldn't be in git
+*.db
+*.sqlite
+*.sqlite3
+
+# Backup files
+*.bak
+*.backup
+*~
+*.swp
+*.swo
 
 # Logs
 *.log
