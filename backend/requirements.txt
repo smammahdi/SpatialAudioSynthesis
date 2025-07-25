@@ -1,0 +1,18 @@
+# Python Backend Requirements for Spatial Audio Synthesis
+fastapi
+uvicorn[standard]
+websockets
+pydantic
+numpy
+python-multipart
+aiofiles
+
+# Audio processing and playback
+pygame  # For audio playback
+sounddevice  # Alternative audio library
+
+# Development and testing (optional)
+# pytest
+# pytest-asyncio
+# black
+# flake8
