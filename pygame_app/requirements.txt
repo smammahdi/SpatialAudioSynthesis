@@ -1,0 +1,11 @@
+# Core dependencies for Spatial Audio System
+pygame>=2.5.0
+numpy>=1.24.0
+sounddevice>=0.4.6
+pyserial>=3.5
+
+# Bluetooth support (optional but recommended)
+bleak>=0.20.0
+
+# Alternative Bluetooth support (legacy fallback)
+# pybluez  # Uncomment if bleak doesn't work on your system
