@@ -80,9 +80,10 @@ class DeviceManager:
     
     def __init__(self):
         self.devices: Dict[str, Device] = {}
-        self.demo_device: Optional[Device] = None
+        self.demo_devices: Dict[str, Device] = {}  # Track multiple demo devices
         self.demo_mode = False
         self.scanning = False
+        self.demo_device_counter = 0  # For generating unique demo device IDs
         
         # Callbacks
         self.on_device_connected: Optional[Callable[[str, str], None]] = None
@@ -103,15 +104,22 @@ class DeviceManager:
             'BT_ANURON', 'HC-', 'linvor', 'HC05', 'HC-05', 'HC-06', 'HC06'
         ]
         
+        # Common HC-05 service UUIDs - these might need to be updated based on your device
         self.hc05_service_uuids = [
             "0000ffe0-0000-1000-8000-00805f9b34fb",  # HC-05 default service
-            "00001101-0000-1000-8000-00805f9b34fb",  # Serial Port Profile
-            "0000ffe1-0000-1000-8000-00805f9b34fb"   # HC-05 characteristic
+            "00001101-0000-1000-8000-00805f9b34fb",  # Serial Port Profile (SPP)
+            "0000ffe1-0000-1000-8000-00805f9b34fb",  # HC-05 characteristic
+            "6e400001-b5a3-f393-e0a9-e50e24dcca9e",  # Nordic UART Service
+            "49535343-fe7d-4ae5-8fa9-9fafd205e455"   # Alternative UART service
         ]
         
         self.hc05_characteristic_uuids = [
             "0000ffe1-0000-1000-8000-00805f9b34fb",  # HC-05 main characteristic
-            "00001101-0000-1000-8000-00805f9b34fb"   # Serial Port Profile characteristic
+            "00001101-0000-1000-8000-00805f9b34fb",  # Serial Port Profile characteristic
+            "6e400002-b5a3-f393-e0a9-e50e24dcca9e",  # Nordic UART RX
+            "6e400003-b5a3-f393-e0a9-e50e24dcca9e",  # Nordic UART TX
+            "49535343-1e4d-4bd9-ba61-23c647249616",  # Alternative TX
+            "49535343-8841-43f4-a8d4-ecbe34729bb3"   # Alternative RX
         ]
         
         # Event loop for async operations
@@ -283,13 +291,18 @@ class DeviceManager:
     async def _connect_ble_device_async(self, device_info: BluetoothDeviceInfo, device: Device):
         """Async BLE connection using bleak with HC-05 service discovery"""
         try:
-            print(f"🔗 Connecting to HC-05 device {device_info.name}...")
+            print(f"🔗 Connecting to HC-05 device {device_info.name} ({device_info.address})...")
+            print(f"🎯 Expected data format from ATmega32A: Simple float like '15.3' or startup 'SensorNode Online'")
             
             client = BleakClient(device_info.address)
-            await client.connect(timeout=20.0)
+            await client.connect(timeout=30.0)  # Longer timeout for HC-05
             
             if client.is_connected:
-                print(f"✅ Connected to {device_info.name}")
+                print(f"✅ Successfully connected to {device_info.name}")
+                print(f"📋 Connection details:")
+                print(f"   - Device: {device_info.name}")
+                print(f"   - Address: {device_info.address}")
+                print(f"   - RSSI: {device_info.rssi}dBm")
                 
                 device.status = DeviceStatus.CONNECTED
                 self.bluetooth_clients[device.device_id] = client
@@ -300,23 +313,42 @@ class DeviceManager:
                 # Start HC-05 specific data monitoring
                 await self._monitor_hc05_device(client, device)
             else:
-                raise Exception("Failed to establish connection")
+                raise Exception("Failed to establish BLE connection")
                 
         except Exception as e:
-            print(f"❌ HC-05 connection failed: {e}")
+            print(f"❌ HC-05 connection failed to {device_info.name}: {e}")
+            print(f"🔍 Connection error details:")
+            print(f"   - Device: {device_info.name}")
+            print(f"   - Address: {device_info.address}")
+            print(f"   - Error: {type(e).__name__}: {str(e)}")
             device.status = DeviceStatus.ERROR
             device.error_message = str(e)
 
     async def _monitor_hc05_device(self, client: BleakClient, device: Device):
         """Monitor HC-05 device for data using proven service UUIDs"""
         try:
-            # Discover all services first
+            # Discover all services first - FIXED API CALL
             print(f"🔍 Discovering services for {device.device_name}...")
-            services = await client.get_services()
+            services = client.services  # Use .services property instead of get_services()
             
-            print(f"📋 Found {len(services)} services:")
-            for service in services:
+            # Convert to list to get count and iterate properly
+            service_list = list(services)
+            print(f"📋 Found {len(service_list)} services:")
+            
+            for service in service_list:
                 print(f"  🔧 Service: {service.uuid}")
+                # Also show characteristics for each service
+                for char in service.characteristics:
+                    properties = []
+                    if "read" in char.properties:
+                        properties.append("read")
+                    if "write" in char.properties:
+                        properties.append("write")
+                    if "notify" in char.properties:
+                        properties.append("notify")
+                    if "indicate" in char.properties:
+                        properties.append("indicate")
+                    print(f"    📱 Characteristic: {char.uuid} [{', '.join(properties)}]")
             
             # Try to find HC-05 compatible characteristics using proven UUIDs
             rx_char = None
@@ -325,9 +357,14 @@ class DeviceManager:
             # Try each known HC-05 service UUID
             for service_uuid in self.hc05_service_uuids:
                 try:
-                    service_found = await client.get_service(service_uuid)
-                    print(f"✅ Found HC-05 service: {service_uuid}")
-                    break
+                    # Use the services property to find the service
+                    for service in service_list:
+                        if str(service.uuid).lower() == service_uuid.lower():
+                            service_found = service
+                            print(f"✅ Found HC-05 service: {service_uuid}")
+                            break
+                    if service_found:
+                        break
                 except Exception as e:
                     print(f"  ❌ Service {service_uuid} not found: {e}")
                     continue
@@ -335,10 +372,9 @@ class DeviceManager:
             if not service_found:
                 # Fallback: try to find any service with notify characteristics
                 print("⚠️  No standard HC-05 service found, trying alternative discovery...")
-                for service in services:
+                for service in service_list:
                     try:
-                        characteristics = await service.get_characteristics()
-                        for char in characteristics:
+                        for char in service.characteristics:
                             if "notify" in char.properties or "read" in char.properties:
                                 rx_char = char
                                 service_found = service
@@ -352,25 +388,26 @@ class DeviceManager:
             else:
                 # Try to get the characteristic from the found service
                 try:
-                    characteristics = await service_found.get_characteristics()
-                    print(f"📡 Found {len(characteristics)} characteristics in service:")
+                    print(f"📡 Found {len(service_found.characteristics)} characteristics in service:")
                     
-                    for char in characteristics:
-                        props = []
-                        if hasattr(char.properties, 'notify') and char.properties.notify:
-                            props.append('notify')
-                        if hasattr(char.properties, 'read') and char.properties.read:
-                            props.append('read')
-                        if hasattr(char.properties, 'write') and char.properties.write:
-                            props.append('write')
+                    for char in service_found.characteristics:
+                        properties = []
+                        if "read" in char.properties:
+                            properties.append("read")
+                        if "write" in char.properties:
+                            properties.append("write")
+                        if "notify" in char.properties:
+                            properties.append("notify")
+                        if "indicate" in char.properties:
+                            properties.append("indicate")
                         
-                        print(f"  📱 Characteristic: {char.uuid} [{', '.join(props)}]")
+                        print(f"  📱 Characteristic: {char.uuid} [{', '.join(properties)}]")
                         
                         # Prefer notify characteristics for HC-05 data
-                        if hasattr(char.properties, 'notify') and char.properties.notify:
+                        if "notify" in char.properties:
                             rx_char = char
                             break
-                        elif not rx_char and (hasattr(char.properties, 'read') and char.properties.read):
+                        elif not rx_char and "read" in char.properties:
                             rx_char = char
                             
                 except Exception as e:
@@ -381,33 +418,55 @@ class DeviceManager:
                 
                 def notification_handler(sender: int, data: bytearray):
                     try:
-                        message = data.decode('utf-8', errors='ignore').strip()
-                        if message:  # Only process non-empty messages
-                            print(f"📦 Raw data from {device.device_name}: '{message}'")
-                            self._process_hc05_data(device.device_id, message)
+                        # Log raw data first
+                        raw_data = data.decode('utf-8', errors='ignore').strip()
+                        print(f"📦 RAW DATA from {device.device_name}: '{raw_data}' (bytes: {len(data)})")
+                        
+                        if raw_data:  # Only process non-empty messages
+                            self._process_hc05_data(device.device_id, raw_data)
                     except Exception as e:
-                        print(f"⚠️  Data processing error: {e}")
+                        # Log error but continue running - don't crash the app
+                        print(f"⚠️  Data processing error from {device.device_name}: {e}")
+                        print(f"📝 Raw data causing error: {data}")
+                        # App continues running
                 
                 # Start notifications if supported
-                if hasattr(rx_char.properties, 'notify') and rx_char.properties.notify:
+                if "notify" in rx_char.properties:
                     await client.start_notify(rx_char, notification_handler)
                     print(f"✅ Started notifications on {rx_char.uuid}")
+                    print(f"🎯 Waiting for distance data from ATmega32A...")
                 else:
                     print("⚠️  Characteristic doesn't support notify, will poll instead")
                     # Start polling for devices that don't support notifications
                     asyncio.create_task(self._poll_hc05_data(client, rx_char, device))
                 
-                # Keep connection alive
+                # Keep connection alive and log status
+                connection_start = time.time()
                 while client.is_connected and device.device_id in self.devices:
                     await asyncio.sleep(1.0)
                     
+                    # Log connection status every 10 seconds
+                    if int(time.time() - connection_start) % 10 == 0:
+                        print(f"🔗 HC-05 connection alive for {int(time.time() - connection_start)}s - waiting for data...")
+                    
             else:
-                print("⚠️  No suitable data characteristic found, using simulated data")
-                await self._simulate_hc05_data(device)
+                print("❌ No suitable data characteristic found for HC-05")
+                print("🔍 Available characteristics:")
+                for service in service_list:
+                    for char in service.characteristics:
+                        print(f"  📱 {char.uuid} - Properties: {char.properties}")
+                
+                # Don't fall back to simulation - keep trying
+                print("⚠️  Will keep connection open but no data will be received")
+                while client.is_connected and device.device_id in self.devices:
+                    await asyncio.sleep(5.0)
+                    print(f"⏳ Still connected to {device.device_name}, but no data characteristic found")
                 
         except Exception as e:
             print(f"❌ HC-05 monitoring error: {e}")
-            await self._simulate_hc05_data(device)
+            print(f"🔍 Error details: {type(e).__name__}: {str(e)}")
+            # Don't simulate data - let the user know there's a real issue
+            print("❌ Real connection failed - check HC-05 device and pairing")
 
     async def _poll_hc05_data(self, client: BleakClient, characteristic, device: Device):
         """Poll HC-05 device for data when notifications aren't supported"""
@@ -415,13 +474,13 @@ class DeviceManager:
         
         while client.is_connected and device.device_id in self.devices:
             try:
-                if hasattr(characteristic.properties, 'read') and characteristic.properties.read:
+                if "read" in characteristic.properties:
                     data = await client.read_gatt_char(characteristic)
                     if data:
-                        message = data.decode('utf-8', errors='ignore').strip()
-                        if message:
-                            print(f"📦 Polled data from {device.device_name}: '{message}'")
-                            self._process_hc05_data(device.device_id, message)
+                        raw_data = data.decode('utf-8', errors='ignore').strip()
+                        if raw_data:
+                            print(f"📦 RAW POLLED DATA from {device.device_name}: '{raw_data}' (bytes: {len(data)})")
+                            self._process_hc05_data(device.device_id, raw_data)
                 
                 await asyncio.sleep(0.5)  # Poll every 500ms
                 
@@ -432,7 +491,20 @@ class DeviceManager:
     def _process_hc05_data(self, device_id: str, data: str):
         """Process HC-05 data using the same logic as the working HTML"""
         try:
+            # Get friendly device name for logging
+            device = self.devices.get(device_id)
+            device_name = device.device_name if device else device_id
+            
+            print(f"🧠 Processing data from {device_name}: '{data}'")
             distance = None
+            
+            # Based on ATmega32A code, it sends: sprintf(buffer, "%s\n", dist_str);
+            # where dist_str is formatted as dtostrf(distance, 5, 1, dist_str) - so "  15.3" format
+            
+            # Handle startup message
+            if "SensorNode Online" in data:
+                print(f"✅ {device_name} startup message received")
+                return
             
             # Try to parse JSON format first: {"angle": 60, "distance": 15.3}
             if data.startswith('{') and data.endswith('}'):
@@ -440,30 +512,55 @@ class DeviceManager:
                     json_data = json.loads(data)
                     if 'distance' in json_data:
                         distance = float(json_data['distance'])
-                except:
-                    pass
+                        print(f"📊 Parsed JSON distance from {device_name}: {distance}cm")
+                except Exception as e:
+                    print(f"⚠️  JSON parsing failed for {device_name}: {e}")
             
-            # Primary format: Simple distance value like "15.3"
+            # Primary format: Simple distance value like "15.3" or "  15.3"
             if distance is None:
                 try:
-                    distance = float(data.strip())
-                except ValueError:
+                    # Clean up the string - remove whitespace and try to parse
+                    clean_data = data.strip()
+                    distance = float(clean_data)
+                    print(f"📊 Parsed simple distance from {device_name}: {distance}cm")
+                except ValueError as e:
+                    print(f"⚠️  Simple parsing failed for {device_name} '{clean_data}': {e}")
+                    
                     # Fallback parsing for legacy formats
                     if ':' in data:
-                        parts = data.split(':')
-                        if len(parts) > 1:
-                            distance = float(parts[1].strip())
+                        try:
+                            parts = data.split(':')
+                            if len(parts) > 1:
+                                distance = float(parts[1].strip())
+                                print(f"📊 Parsed colon-separated distance from {device_name}: {distance}cm")
+                        except ValueError as e:
+                            print(f"⚠️  Colon parsing failed for {device_name}: {e}")
                     elif 'cm' in data.lower():
-                        distance = float(data.lower().replace('cm', '').strip())
+                        try:
+                            distance = float(data.lower().replace('cm', '').strip())
+                            print(f"📊 Parsed cm-suffixed distance from {device_name}: {distance}cm")
+                        except ValueError as e:
+                            print(f"⚠️  CM parsing failed for {device_name}: {e}")
             
-            if distance is not None and distance >= 0 and distance <= 400:  # Valid range
-                self._update_device_distance(device_id, distance)
-                print(f"📏 {device_id}: {distance}cm")
+            # Validate distance range (ATmega32A sends 1-200cm based on code)
+            if distance is not None:
+                if 1.0 <= distance <= 400.0:  # Valid range
+                    self._update_device_distance(device_id, distance)
+                    print(f"✅ Valid distance from {device_name}: {distance}cm")
+                else:
+                    print(f"⚠️  Distance out of range from {device_name}: {distance}cm (expected 1-400cm)")
+                    # Log error but continue - don't crash the app
             else:
-                print(f"⚠️  Invalid distance from {device_id}: {data}")
+                print(f"❌ Could not parse distance from {device_name}: '{data}' - continuing...")
+                # App continues running despite parse failure
             
-        except (ValueError, IndexError, TypeError) as e:
-            print(f"⚠️  HC-05 data parsing error for '{data}': {e}")
+        except Exception as e:
+            device = self.devices.get(device_id)
+            device_name = device.device_name if device else device_id
+            print(f"⚠️  HC-05 data processing error for {device_name} '{data}': {e}")
+            print(f"📝 Error details: {type(e).__name__}")
+            # Don't print traceback - just log and continue
+            # App continues running
 
     async def _simulate_hc05_data(self, device: Device):
         """Simulate HC-05 data for testing when real connection fails"""
@@ -729,67 +826,167 @@ class DeviceManager:
                 if dev.status == DeviceStatus.CONNECTED]
 
     def start_demo_mode(self):
-        """Start demo mode with simulated HC-05 device"""
+        """Start demo mode without any initial devices"""
         if self.demo_mode:
             return
             
         self.demo_mode = True
-        self.demo_device = Device(
-            device_id="demo_hc05_001",
-            device_name="Demo HC-05 SensorNode",
-            status=DeviceStatus.CONNECTED,
-            audio_file="sine_440",
-            device_type="demo"
-        )
-        
-        self.devices[self.demo_device.device_id] = self.demo_device
-        
-        if self.on_device_connected:
-            self.on_device_connected(self.demo_device.device_id, self.demo_device.device_name)
-        
-        # Start demo data generation
-        demo_thread = threading.Thread(target=self._demo_worker, daemon=True)
-        demo_thread.start()
+        self.demo_devices.clear()  # Clear any existing demo devices
+        self.demo_device_counter = 0
         
         print("✅ HC-05 demo mode activated")
 
-    def _demo_worker(self):
-        """Generate demo data that mimics HC-05 distance sensor"""
-        while self.demo_mode and self.running:
-            if self.demo_device:
-                # Generate realistic distance pattern
-                cycle_progress = (time.time() % 30.0) / 30.0
-                base_distance = 0.5 * (1 - math.cos(cycle_progress * math.pi * 2))
+    def add_demo_device(self, custom_name: str = None) -> str:
+        """Add a new demo device and return its ID"""
+        if not self.demo_mode:
+            print("❌ Demo mode must be enabled first")
+            return None
+        
+        self.demo_device_counter += 1
+        device_id = f"demo_hc05_{self.demo_device_counter:03d}"
+        
+        if custom_name:
+            device_name = custom_name
+        else:
+            device_name = f"Demo HC-05 SensorNode {self.demo_device_counter}"
+        
+        # Generate a random starting distance for variety
+        starting_distance = random.uniform(20.0, 150.0)
+        
+        demo_device = Device(
+            device_id=device_id,
+            device_name=device_name,
+            status=DeviceStatus.CONNECTED,
+            audio_file="sine_440",
+            device_type="demo",
+            last_distance=starting_distance
+        )
+        
+        # Add to both demo devices and main devices collections
+        self.demo_devices[device_id] = demo_device
+        self.devices[device_id] = demo_device
+        
+        if self.on_device_connected:
+            self.on_device_connected(device_id, device_name)
+        
+        # Start individual demo data generation for this device
+        self._start_demo_worker_for_device(device_id)
+        
+        print(f"✅ Added demo device: {device_name} (starting at {starting_distance:.1f}cm)")
+        return device_id
+
+    def remove_demo_device(self, device_id: str = None) -> bool:
+        """Remove a specific demo device, or the most recent one if no ID provided"""
+        if not self.demo_mode:
+            print("❌ Demo mode must be enabled first")
+            return False
+        
+        if not self.demo_devices:
+            print("❌ No demo devices to remove")
+            return False
+        
+        # If no device_id specified, remove the most recent one
+        if device_id is None:
+            device_id = max(self.demo_devices.keys())  # Get the highest numbered device
+        
+        if device_id not in self.demo_devices:
+            print(f"❌ Demo device {device_id} not found")
+            return False
+        
+        demo_device = self.demo_devices[device_id]
+        device_name = demo_device.device_name
+        
+        # Remove from collections
+        self.demo_devices.pop(device_id, None)
+        self.disconnect_device(device_id)  # This removes from main devices collection
+        
+        print(f"✅ Removed demo device: {device_name}")
+        return True
+
+    def clear_all_demo_devices(self):
+        """Remove all demo devices"""
+        if not self.demo_mode:
+            print("❌ Demo mode must be enabled first")
+            return
+        
+        device_count = len(self.demo_devices)
+        if device_count == 0:
+            print("❌ No demo devices to clear")
+            return
+        
+        # Remove all demo devices
+        for device_id in list(self.demo_devices.keys()):
+            self.disconnect_device(device_id)
+        
+        self.demo_devices.clear()
+        print(f"✅ Cleared {device_count} demo devices")
+
+    def _start_demo_worker_for_device(self, device_id: str):
+        """Start a demo data worker thread for a specific device"""
+        def demo_worker():
+            device = self.demo_devices.get(device_id)
+            if not device:
+                return
+            
+            # Each device has its own unique pattern
+            device_seed = hash(device_id) % 1000
+            base_frequency = 0.1 + (device_seed % 5) * 0.05  # Different cycle speeds
+            base_offset = (device_seed % 10) * 3.0  # Different starting phases
+            
+            while (self.demo_mode and self.running and 
+                   device_id in self.demo_devices and 
+                   device_id in self.devices):
+                
+                # Generate unique pattern for each device
+                cycle_progress = (time.time() * base_frequency) % (2 * math.pi)
+                base_distance = 0.5 * (1 - math.cos(cycle_progress + base_offset))
                 distance = max(5.0, min(175.0, base_distance * 170.0 + random.uniform(-3.0, 3.0)))
                 
-                self._update_device_distance(self.demo_device.device_id, distance)
-            
-            time.sleep(0.2)  # 5Hz update rate
+                self._update_device_distance(device_id, distance)
+                time.sleep(0.2)  # 5Hz update rate
+        
+        # Start the worker thread
+        demo_thread = threading.Thread(target=demo_worker, daemon=True)
+        demo_thread.start()
+
+    def _demo_worker(self):
+        """Legacy demo worker - now handles multiple devices"""
+        # This method is kept for backwards compatibility but doesn't do much
+        # Individual device workers are started by _start_demo_worker_for_device
+        while self.demo_mode and self.running:
+            # Just sleep, individual device workers handle the data generation
+            time.sleep(1.0)
 
     def stop_demo_mode(self):
-        """Stop demo mode"""
+        """Stop demo mode and remove all demo devices"""
         if not self.demo_mode:
             return
             
         self.demo_mode = False
-        if self.demo_device:
-            self.disconnect_device(self.demo_device.device_id)
-        self.demo_device = None
         
-        print("✅ HC-05 demo mode deactivated")
+        # Remove all demo devices
+        device_count = len(self.demo_devices)
+        for device_id in list(self.demo_devices.keys()):
+            self.disconnect_device(device_id)
+        
+        self.demo_devices.clear()
+        self.demo_device_counter = 0
+        
+        print(f"✅ HC-05 demo mode deactivated - removed {device_count} demo devices")
 
     def get_device_statistics(self) -> Dict[str, Any]:
         """Get device manager statistics"""
         connected_count = len(self.get_connected_devices())
         bluetooth_count = len([d for d in self.devices.values() if d.device_type == "bluetooth"])
         serial_count = len([d for d in self.devices.values() if d.device_type == "serial"])
+        demo_count = len(self.demo_devices)
         
         return {
             'total_devices': len(self.devices),
             'connected_devices': connected_count,
             'bluetooth_devices': bluetooth_count,
             'serial_devices': serial_count,
-            'demo_devices': 1 if self.demo_mode else 0,
+            'demo_devices': demo_count,
             'demo_mode_active': self.demo_mode,
             'bluetooth_available': BLUETOOTH_AVAILABLE,
             'bluetooth_library': BLUETOOTH_LIBRARY,

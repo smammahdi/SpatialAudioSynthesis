@@ -169,6 +169,14 @@ class DeviceScanner:
         self.scan_type = "bluetooth"
         self.hc05_only_mode = True  # New flag for strict HC-05 filtering
         
+        # Real-time scanning state
+        self.real_time_scanning = False
+        self.real_time_thread = None
+        self.device_update_lock = threading.Lock()
+        self.last_scan_time = 0.0
+        self.scan_interval = 5.0  # Scan every 5 seconds in real-time mode
+        self.device_cache = {}  # Cache to track device changes
+        
         # Scrolling state
         self.scroll_offset = 0
         self.max_scroll = 0
@@ -184,12 +192,276 @@ class DeviceScanner:
         self.overlay.set_alpha(128)
         self.overlay.fill((0, 0, 0))
 
+    def start_real_time_scanning(self):
+        """Start continuous real-time Bluetooth scanning"""
+        if not BLUETOOTH_AVAILABLE or self.real_time_scanning:
+            return
+        
+        self.real_time_scanning = True
+        self.status_message = "🔄 Real-time scanning active - devices will update automatically"
+        
+        def real_time_worker():
+            """Background worker for continuous device scanning"""
+            while self.real_time_scanning and self.running:
+                try:
+                    current_time = time.time()
+                    
+                    # Only scan if enough time has passed
+                    if current_time - self.last_scan_time >= self.scan_interval:
+                        self.last_scan_time = current_time
+                        
+                        # Perform scan based on current mode
+                        if self.hc05_only_mode:
+                            self._real_time_hc05_scan()
+                        else:
+                            self._real_time_all_bluetooth_scan()
+                    
+                    time.sleep(1.0)  # Check every second
+                    
+                except Exception as e:
+                    print(f"Real-time scanning error: {e}")
+                    time.sleep(5.0)  # Wait longer on error
+        
+        self.real_time_thread = threading.Thread(target=real_time_worker, daemon=True)
+        self.real_time_thread.start()
+        
+        print("✅ Real-time Bluetooth scanning started")
+
+    def stop_real_time_scanning(self):
+        """Stop continuous real-time scanning"""
+        if not self.real_time_scanning:
+            return
+        
+        self.real_time_scanning = False
+        self.status_message = "Real-time scanning stopped"
+        
+        if self.real_time_thread:
+            self.real_time_thread.join(timeout=2.0)
+        
+        print("✅ Real-time Bluetooth scanning stopped")
+
+    def _real_time_hc05_scan(self):
+        """Real-time HC-05 device scanning with change detection"""
+        try:
+            if BLUETOOTH_LIBRARY == "bleak":
+                self._real_time_hc05_scan_bleak()
+            else:
+                self._real_time_hc05_scan_pybluez()
+        except Exception as e:
+            print(f"Real-time HC-05 scan error: {e}")
+
+    def _real_time_hc05_scan_bleak(self):
+        """Real-time HC-05 scanning using bleak"""
+        import asyncio
+        
+        async def async_real_time_scan():
+            try:
+                devices = await BleakScanner.discover(timeout=3.0)  # Shorter timeout for real-time
+                
+                new_devices = []
+                device_ids = set()
+                
+                for device in devices:
+                    device_name = device.name or f"Unknown-{device.address[-5:].replace(':', '')}"
+                    rssi = getattr(device, 'rssi', 0)
+                    
+                    bt_device = BluetoothDeviceInfo(
+                        address=device.address,
+                        name=device_name,
+                        rssi=rssi
+                    )
+                    
+                    # Only include HC-05 compatible devices in strict mode
+                    if bt_device.is_hc05_compatible and bt_device.hc05_confidence >= 30:
+                        new_devices.append(bt_device)
+                        device_ids.add(device.address)
+                
+                # Update device list with thread safety
+                with self.device_update_lock:
+                    # Check for changes
+                    current_ids = {getattr(d, 'address', str(i)) for i, d in enumerate(self.available_devices) 
+                                 if hasattr(d, 'is_bluetooth')}
+                    
+                    if device_ids != current_ids:
+                        # Sort by HC-05 confidence
+                        new_devices.sort(key=lambda d: d.hc05_confidence, reverse=True)
+                        
+                        # Preserve selection if possible
+                        selected_device = None
+                        if (self.selected_device_index is not None and 
+                            self.selected_device_index < len(self.available_devices)):
+                            selected_device = self.available_devices[self.selected_device_index]
+                        
+                        # Update device list
+                        self.available_devices = new_devices
+                        self._update_scroll_limits()
+                        
+                        # Try to maintain selection
+                        if selected_device and hasattr(selected_device, 'address'):
+                            for i, device in enumerate(self.available_devices):
+                                if hasattr(device, 'address') and device.address == selected_device.address:
+                                    self.selected_device_index = i
+                                    break
+                            else:
+                                self.selected_device_index = None
+                        
+                        # Update status
+                        device_count = len(new_devices)
+                        if device_count == 0:
+                            self.status_message = "🔄 Real-time scan: No HC-05 devices found"
+                        else:
+                            self.status_message = f"🔄 Real-time scan: {device_count} HC-05 device(s) found"
+                        
+                        print(f"📡 Real-time update: {device_count} HC-05 devices")
+                
+            except Exception as e:
+                print(f"Real-time bleak scan error: {e}")
+        
+        try:
+            asyncio.run(async_real_time_scan())
+        except Exception as e:
+            print(f"Real-time scan execution error: {e}")
+
+    def _real_time_hc05_scan_pybluez(self):
+        """Real-time HC-05 scanning using pybluez"""
+        try:
+            import bluetooth
+            
+            nearby_devices = bluetooth.discover_devices(
+                duration=3, lookup_names=True, flush_cache=True, lookup_class=True
+            )
+            
+            new_devices = []
+            device_ids = set()
+            
+            for addr, name, device_class in nearby_devices:
+                device_name = name if name else f"Unknown-{addr[-5:].replace(':', '')}"
+                
+                bt_device = BluetoothDeviceInfo(addr, device_name, device_class)
+                
+                if bt_device.is_hc05_compatible and bt_device.hc05_confidence >= 30:
+                    new_devices.append(bt_device)
+                    device_ids.add(addr)
+            
+            # Update with thread safety
+            with self.device_update_lock:
+                current_ids = {getattr(d, 'address', str(i)) for i, d in enumerate(self.available_devices) 
+                             if hasattr(d, 'is_bluetooth')}
+                
+                if device_ids != current_ids:
+                    new_devices.sort(key=lambda d: d.hc05_confidence, reverse=True)
+                    self.available_devices = new_devices
+                    self._update_scroll_limits()
+                    
+                    device_count = len(new_devices)
+                    self.status_message = f"🔄 Real-time scan: {device_count} HC-05 device(s) found"
+                    print(f"📡 Real-time update (PyBluez): {device_count} HC-05 devices")
+                    
+        except Exception as e:
+            print(f"Real-time PyBluez scan error: {e}")
+
+    def _real_time_all_bluetooth_scan(self):
+        """Real-time scanning for all Bluetooth devices"""
+        try:
+            if BLUETOOTH_LIBRARY == "bleak":
+                self._real_time_all_scan_bleak()
+            else:
+                self._real_time_all_scan_pybluez()
+        except Exception as e:
+            print(f"Real-time all devices scan error: {e}")
+
+    def _real_time_all_scan_bleak(self):
+        """Real-time all devices scanning using bleak"""
+        import asyncio
+        
+        async def async_real_time_all_scan():
+            try:
+                devices = await BleakScanner.discover(timeout=3.0)
+                
+                new_devices = []
+                device_ids = set()
+                
+                for device in devices:
+                    device_name = device.name or f"Unknown-{device.address[-5:].replace(':', '')}"
+                    rssi = getattr(device, 'rssi', 0)
+                    
+                    bt_device = BluetoothDeviceInfo(
+                        address=device.address,
+                        name=device_name,
+                        rssi=rssi
+                    )
+                    new_devices.append(bt_device)
+                    device_ids.add(device.address)
+                
+                # Update with thread safety
+                with self.device_update_lock:
+                    current_ids = {getattr(d, 'address', str(i)) for i, d in enumerate(self.available_devices) 
+                                 if hasattr(d, 'is_bluetooth')}
+                    
+                    if device_ids != current_ids:
+                        # Sort: HC-05 devices first, then by name
+                        new_devices.sort(key=lambda d: (-d.hc05_confidence, d.name))
+                        self.available_devices = new_devices
+                        self._update_scroll_limits()
+                        
+                        hc05_count = len([d for d in new_devices if d.is_hc05_compatible])
+                        total_count = len(new_devices)
+                        self.status_message = f"🔄 Real-time scan: {total_count} devices ({hc05_count} HC-05 compatible)"
+                        print(f"📡 Real-time update: {total_count} devices, {hc05_count} HC-05")
+                
+            except Exception as e:
+                print(f"Real-time all devices bleak scan error: {e}")
+        
+        try:
+            asyncio.run(async_real_time_all_scan())
+        except Exception as e:
+            print(f"Real-time all scan execution error: {e}")
+
+    def _real_time_all_scan_pybluez(self):
+        """Real-time all devices scanning using pybluez"""
+        try:
+            import bluetooth
+            
+            nearby_devices = bluetooth.discover_devices(
+                duration=3, lookup_names=True, flush_cache=True, lookup_class=True
+            )
+            
+            new_devices = []
+            device_ids = set()
+            
+            for addr, name, device_class in nearby_devices:
+                device_name = name if name else f"Unknown Device ({addr})"
+                new_devices.append(BluetoothDeviceInfo(addr, device_name, device_class))
+                device_ids.add(addr)
+            
+            # Update with thread safety
+            with self.device_update_lock:
+                current_ids = {getattr(d, 'address', str(i)) for i, d in enumerate(self.available_devices) 
+                             if hasattr(d, 'is_bluetooth')}
+                
+                if device_ids != current_ids:
+                    new_devices.sort(key=lambda d: (-d.hc05_confidence, d.name))
+                    self.available_devices = new_devices
+                    self._update_scroll_limits()
+                    
+                    hc05_count = len([d for d in new_devices if d.is_hc05_compatible])
+                    total_count = len(new_devices)
+                    self.status_message = f"🔄 Real-time scan: {total_count} devices ({hc05_count} HC-05 compatible)"
+                    print(f"📡 Real-time update (PyBluez): {total_count} devices, {hc05_count} HC-05")
+                    
+        except Exception as e:
+            print(f"Real-time all devices PyBluez scan error: {e}")
+
     def _scan_for_hc05_devices(self):
         """Scans specifically for HC-05 devices with strict filtering."""
         if self.scanning or not BLUETOOTH_AVAILABLE:
             if not BLUETOOTH_AVAILABLE:
                 self.status_message = f"Bluetooth not available. Library: {BLUETOOTH_LIBRARY}"
             return
+        
+        # Stop real-time scanning if active
+        if self.real_time_scanning:
+            self.stop_real_time_scanning()
             
         self.scanning = True
         self.scan_type = "bluetooth"
@@ -211,6 +483,11 @@ class DeviceScanner:
                 print(f"HC-05 scanning error: {e}")
             
             self.scanning = False
+            
+            # Auto-start real-time scanning after initial scan
+            if BLUETOOTH_AVAILABLE and len(self.available_devices) > 0:
+                time.sleep(1.0)  # Brief pause
+                self.start_real_time_scanning()
         
         scan_thread = threading.Thread(target=hc05_strict_scan_worker, daemon=True)
         scan_thread.start()
@@ -305,6 +582,10 @@ class DeviceScanner:
         """Scans for ALL Bluetooth devices (not filtered)."""
         if self.scanning or not BLUETOOTH_AVAILABLE:
             return
+        
+        # Stop real-time scanning if active
+        if self.real_time_scanning:
+            self.stop_real_time_scanning()
             
         self.scanning = True
         self.scan_type = "bluetooth"
@@ -326,6 +607,11 @@ class DeviceScanner:
                 print(f"All devices scanning error: {e}")
             
             self.scanning = False
+            
+            # Auto-start real-time scanning after initial scan
+            if BLUETOOTH_AVAILABLE and len(self.available_devices) > 0:
+                time.sleep(1.0)  # Brief pause
+                self.start_real_time_scanning()
         
         scan_thread = threading.Thread(target=bluetooth_scan_all_worker, daemon=True)
         scan_thread.start()
@@ -539,6 +825,15 @@ class DeviceScanner:
         if 'scan_serial' in self.button_rects and self.button_rects['scan_serial'].collidepoint(pos):
             if not self.scanning:
                 self._scan_for_serial_ports()
+            return
+
+        # Real-time scanning toggle
+        if 'toggle_realtime' in self.button_rects and self.button_rects['toggle_realtime'].collidepoint(pos):
+            if self.real_time_scanning:
+                self.stop_real_time_scanning()
+            else:
+                if BLUETOOTH_AVAILABLE and not self.scanning:
+                    self.start_real_time_scanning()
             return
 
         if 'connect' in self.button_rects and self.button_rects['connect'].collidepoint(pos):
@@ -781,9 +1076,14 @@ class DeviceScanner:
                 ('scan_hc05', 'Scan HC-05', COLORS['primary'], 20),
                 ('scan_all_bluetooth', 'Scan All BT', COLORS['warning'], 170),
             ])
+            
+            # Real-time scanning toggle button
+            realtime_text = 'Stop Real-time' if self.real_time_scanning else 'Real-time Scan'
+            realtime_color = COLORS['error'] if self.real_time_scanning else COLORS['success']
+            buttons.append(('toggle_realtime', realtime_text, realtime_color, 320))
         
         # Serial button  
-        serial_x = 320 if BLUETOOTH_AVAILABLE else 20
+        serial_x = 470 if BLUETOOTH_AVAILABLE else 20
         buttons.append(('scan_serial', 'Scan Serial', COLORS['success'], serial_x))
         
         # Control buttons
@@ -793,18 +1093,28 @@ class DeviceScanner:
         ])
         
         for btn_id, btn_text, btn_color, btn_x in buttons:
+            # Adjust button state colors
             if btn_id == 'connect' and self.selected_device_index is None:
                 btn_color = COLORS['surface_light']  # Disabled state
+            elif btn_id == 'toggle_realtime' and not BLUETOOTH_AVAILABLE:
+                btn_color = COLORS['surface_light']  # Disabled if no Bluetooth
+            elif btn_id in ['scan_hc05', 'scan_all_bluetooth', 'scan_serial'] and self.scanning:
+                btn_color = COLORS['surface_light']  # Disabled while scanning
             
             button_rect = pygame.Rect(btn_x, button_y, button_width, button_height)
             
             # Button hover effect
-            if button_rect.collidepoint(self.mouse_pos) and not self.scanning:
-                if btn_id != 'connect' or self.selected_device_index is not None:
-                    hover_color = tuple(min(255, c + 25) for c in btn_color)
-                    pygame.draw.rect(self.modal_surface, hover_color, button_rect, border_radius=6)
-                else:
-                    pygame.draw.rect(self.modal_surface, btn_color, button_rect, border_radius=6)
+            can_interact = True
+            if btn_id == 'connect' and self.selected_device_index is None:
+                can_interact = False
+            elif btn_id == 'toggle_realtime' and not BLUETOOTH_AVAILABLE:
+                can_interact = False
+            elif btn_id in ['scan_hc05', 'scan_all_bluetooth', 'scan_serial'] and self.scanning:
+                can_interact = False
+            
+            if button_rect.collidepoint(self.mouse_pos) and can_interact:
+                hover_color = tuple(min(255, c + 25) for c in btn_color)
+                pygame.draw.rect(self.modal_surface, hover_color, button_rect, border_radius=6)
             else:
                 pygame.draw.rect(self.modal_surface, btn_color, button_rect, border_radius=6)
             
@@ -813,7 +1123,7 @@ class DeviceScanner:
             
             # Button text
             text_color = COLORS['text_primary']
-            if btn_id == 'connect' and self.selected_device_index is None:
+            if not can_interact:
                 text_color = COLORS['text_muted']
             
             text_surf, text_rect = self.font_body.render(btn_text, text_color)
@@ -827,9 +1137,9 @@ class DeviceScanner:
         instruction_y = POPUP_HEIGHT - 40
         
         if BLUETOOTH_AVAILABLE:
-            instructions = "HC-05: Find SensorNodes • All BT: Show all devices • Scroll: Mouse wheel/Arrow keys • Enter: Connect • Esc: Cancel"
+            instructions = "Real-time: Auto-updates devices • HC-05: Find SensorNodes • All BT: Show all • Scroll: Mouse wheel • Enter: Connect"
         else:
-            instructions = "Install bleak for Bluetooth • Serial: USB connections • Enter: Connect • Esc: Cancel"
+            instructions = "Install bleak for Bluetooth real-time scanning • Serial: USB connections • Enter: Connect • Esc: Cancel"
         
         self.font_small.render_to(self.modal_surface, (PADDING, instruction_y), 
                                 instructions, COLORS['text_muted'])
@@ -837,3 +1147,9 @@ class DeviceScanner:
     def cleanup(self):
         """Clean up scanner resources."""
         self.running = False
+        
+        # Stop real-time scanning
+        if self.real_time_scanning:
+            self.stop_real_time_scanning()
+        
+        print("✅ Device scanner cleanup complete")

@@ -35,6 +35,8 @@ class Config:
         'text_primary': (240, 245, 250),      # Light text
         'text_secondary': (180, 190, 200),    # Secondary text
         'text_muted': (140, 150, 160),        # Muted text
+        'text_light': (255, 255, 255),        # White text for dark backgrounds
+        'text_dark': (40, 50, 60),            # Dark text for light backgrounds
         
         # Status colors
         'success': (80, 180, 120),            # Success green
@@ -47,6 +49,20 @@ class Config:
         'border_light': (80, 90, 105),        # Light border
         'shadow': (0, 0, 0, 50),              # Shadow color
         
+        # Device-specific colors for consistent theming (matches chart_colors)
+        'device_colors': [
+            (70, 130, 200),   # Blue
+            (120, 180, 80),   # Green
+            (200, 150, 80),   # Orange
+            (180, 80, 180),   # Purple
+            (80, 180, 180),   # Cyan
+            (200, 80, 120),   # Pink
+            (150, 200, 80),   # Lime
+            (200, 120, 80),   # Coral
+            (100, 200, 160),  # Mint
+            (200, 100, 100),  # Red
+        ],
+        
         # Chart colors (for device visualization)
         'chart_colors': [
             (70, 130, 200),   # Blue
@@ -57,17 +73,23 @@ class Config:
             (200, 80, 120),   # Pink
             (150, 200, 80),   # Lime
             (200, 120, 80),   # Coral
+            (100, 200, 160),  # Mint
+            (200, 100, 100),  # Red
         ]
     }
     
     # Typography
     FONTS = {
         'title': ('Segoe UI', 28),
+        'h1': ('Segoe UI', 24),
+        'h2': ('Segoe UI', 20),
+        'h3': ('Segoe UI', 18),
         'subtitle': ('Segoe UI', 20),
         'heading': ('Segoe UI', 16),
         'body': ('Segoe UI', 14),
         'caption': ('Segoe UI', 12),
-        'small': ('Segoe UI', 10)
+        'small': ('Segoe UI', 10),
+        'tiny': ('Segoe UI', 8)
     }
     
     # Layout settings

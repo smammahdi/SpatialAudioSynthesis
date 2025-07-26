@@ -1,0 +1,200 @@
+/* 
+ * Integrated Servo + Sonar + Bluetooth Code - Distance Only on LCD/Bluetooth
+ * Servo motor connected to PD5 (OC1A)
+ * Echo pin should be connected to PD2 (INT0)
+ * LCD connections: D4-D7 on PORTA, RS,EN on PORTC 
+ * HC-05 Bluetooth: TX to PD1 (TXD), RX to PD0 (RXD)
+ */ 
+#define F_CPU 1000000UL // 1 MHz clock speed 
+
+// === CONFIGURABLE MACROS ===
+#define MAX_DIST_BLINK 30        // Maximum valid sonar distance (cm)
+#define MAX_DIST 200
+
+// === LCD pin definitions ===
+#define D4 eS_PORTA4
+#define D5 eS_PORTA5
+#define D6 eS_PORTA6
+#define D7 eS_PORTA7
+#define RS eS_PORTC6
+#define EN eS_PORTC7
+
+#include <avr/io.h> 
+#include <avr/interrupt.h> 
+#include <util/delay.h> 
+#include <stdlib.h> 
+#include <stdio.h> 
+#include "lcd.h" 
+
+// === Ultrasonic sensor pins ===
+#define TRIGGER_PIN PA0 
+#define LED_PIN PA1 
+
+// === Servo PWM values for 1MHz clock ===
+#define SERVO_m60_DEG   260   // ~-60°
+#define SERVO_60_DEG    103   // ~+60°
+
+/* --- Volatile globals for sonar, servo, display, comms --- */
+volatile uint8_t is_measuring = 0;      
+volatile uint16_t timer2_overflows = 0;
+volatile uint16_t start_time = 0;
+volatile double distance_cm = 0;        
+volatile uint8_t measurement_ready = 0; 
+volatile uint8_t servo_position = 0; // 0 = -60°, 1 = +60°
+volatile uint16_t main_counter = 0;
+
+// === UART for Bluetooth ===
+void uart_init(void) {
+    // Set baud rate to 9600 for 1MHz clock
+    // UBRR = (F_CPU / (16 * BAUD)) - 1
+    // For 9600 baud: UBRR = (1000000 / (16 * 9600)) - 1 = 5.51 ? 6
+    UBRRH = 0;
+    UBRRL = 6;
+    UCSRB = (1 << TXEN);
+    UCSRC = (1 << URSEL) | (1 << UCSZ1) | (1 << UCSZ0); // 8 data, 1 stop, no parity
+}
+
+void uart_send_char(char c) {
+    while (!(UCSRA & (1 << UDRE)));
+    UDR = c;
+}
+
+void uart_send_string(const char* str) {
+    while (*str) uart_send_char(*str++);
+}
+
+void send_bluetooth_distance(double distance) {
+    char buffer[24];
+    char dist_str[10];
+    dtostrf(distance, 5, 1, dist_str); // 1 decimal
+    sprintf(buffer, "%s\n", dist_str);
+    uart_send_string(buffer);
+}
+
+// === Servo ===
+void servo_move(uint16_t position) {
+    OCR1A = position;
+}
+
+// === Display ===
+void display_distance(double distance) {
+    char line[17], float_str[10];
+    Lcd4_Set_Cursor(1,1);
+    if (distance > 1 && distance < MAX_DIST) {
+        dtostrf(distance, 5, 1, float_str);
+        sprintf(line, "Dist: %s cm", float_str);
+    } 
+	else if (distance >= MAX_DIST) {
+        sprintf(line, "Dist: too far");
+    } 
+	else {
+        sprintf(line, "Dist: ---");
+    }
+    Lcd4_Write_String(line);
+}
+
+// === Interrupts ===
+ISR(TIMER2_OVF_vect) { timer2_overflows++; }
+
+ISR(INT0_vect) {
+    if (PIND & (1 << PD2)) {         // Rising edge
+        if (!is_measuring) {
+            is_measuring = 1;
+            timer2_overflows = 0;
+            start_time = TCNT2;
+        }
+    } else {                         // Falling edge
+        if (is_measuring) {
+            uint16_t end_time = TCNT2;
+            uint32_t total_ticks;
+            if (timer2_overflows == 0) {
+                total_ticks = (end_time >= start_time) ? (end_time - start_time) : 0;
+            } else {
+                total_ticks = (timer2_overflows - 1) * 256 + (256 - start_time) + end_time;
+            }
+            distance_cm = (double)(total_ticks * 64) / 58.31; 
+            is_measuring = 0;           
+            measurement_ready = 1;      
+        }
+    }
+}
+
+void setup_timers(void) {
+    // Servo PWM: Timer1 Fast PWM, TOP=ICR1, 20ms period, prescaler 8
+    TCCR1A = (1 << COM1A1) | (1 << WGM11);
+    TCCR1B = (1 << WGM13) | (1 << WGM12) | (1 << CS11); // prescaler 8
+    ICR1 = 2500; // 20ms
+    // Timer2 for sonar pulse: prescaler 64
+    TCCR2 = (1 << CS22);
+    TIMSK |= (1 << TOIE2); // Timer2 overflow IRQ
+}
+
+void setup_interrupts(void) {
+    MCUCR |= (1 << ISC00); // Any logical change on INT0
+    GICR |= (1 << INT0);   // Enable INT0
+}
+
+int main(void) {
+    // === GPIO ===
+    DDRA |= (1 << TRIGGER_PIN) | (1 << LED_PIN) | (1 << PA4) | (1 << PA5) | (1 << PA6) | (1 << PA7);
+    DDRC |= (1 << PC6) | (1 << PC7);
+    DDRD |= (1 << PD5) | (1 << PD1); // PWM, TXD
+    DDRD &= ~(1 << PD2); // Echo input
+
+    // === Init Peripherals ===
+    uart_init();
+    setup_timers();
+    setup_interrupts();
+    Lcd4_Init();
+    sei();
+
+    // === Startup ===
+    Lcd4_Clear();
+    Lcd4_Set_Cursor(1,1); Lcd4_Write_String("SONAR+BT SYSTEM");
+    _delay_ms(1000);
+    Lcd4_Clear();
+    Lcd4_Set_Cursor(1,1); Lcd4_Write_String("Dist: --- cm");
+    uart_send_string("SensorNode Online\n");
+    servo_move(SERVO_m60_DEG);
+    servo_position = 0;
+
+    while (1) {
+        // === Sonar Trigger ===
+        if (!is_measuring) {
+            PORTA |= (1 << TRIGGER_PIN);
+            _delay_us(10);
+            PORTA &= ~(1 << TRIGGER_PIN);
+        }
+
+        // === LED for close object ===
+        if (distance_cm > 1 && distance_cm < MAX_DIST_BLINK) {
+            PORTA |= (1 << LED_PIN);
+        } else {
+            PORTA &= ~(1 << LED_PIN);
+        }
+
+        // === Servo sweep ===
+        main_counter++;
+        if (main_counter >= 5) { // ~5*50ms = 250ms per move
+            main_counter = 0;
+            if (servo_position == 0) {
+                servo_move(SERVO_60_DEG);
+                servo_position = 1;
+            } else {
+                servo_move(SERVO_m60_DEG);
+                servo_position = 0;
+            }
+        }
+
+        // === LCD and BLUETOOTH update instantly when a new measurement is ready ===
+        if (measurement_ready) {
+            measurement_ready = 0;
+            display_distance(distance_cm);
+            if (distance_cm > 1 && distance_cm < MAX_DIST) {
+                send_bluetooth_distance(distance_cm);
+            }
+        }
+
+        _delay_ms(50); // Main loop delay
+    }
+}

@@ -41,6 +41,11 @@ class AudioChannel:
     is_playing: bool
     last_update: float
     is_enabled: bool = True
+    # New fields for play-to-completion logic
+    audio_start_time: float = 0.0
+    audio_duration: float = 0.0
+    pending_volume: Optional[float] = None
+    pending_frequency: Optional[float] = None
 
 class SpatialAudioEngine:
     """Enhanced spatial audio synthesis engine with real-time mixing"""
@@ -55,7 +60,7 @@ class SpatialAudioEngine:
         self.buffer_size = 1024
         
         # Real-time audio mixing
-        self.mixing_enabled = True
+        self.mixing_enabled = False  # Temporarily disable mixing for better audio file support
         self.mixed_audio_queue = queue.Queue(maxsize=10)
         self.audio_thread = None
         self.mixing_thread = None
@@ -80,8 +85,8 @@ class SpatialAudioEngine:
             # Fallback initialization
             pygame.mixer.init()
             
-        # Create default audio sources
-        self._create_default_sources()
+        # Load audio files from the audio_files directory only
+        self._load_project_audio_files()
         
         # Start real-time audio processing
         self._start_audio_processing()
@@ -133,6 +138,60 @@ class SpatialAudioEngine:
                 waveform=waveform
             )
     
+    def _load_project_audio_files(self):
+        """Load only audio files from the project's audio_files directory"""
+        try:
+            # Clear existing audio sources to start fresh
+            self.audio_sources.clear()
+            
+            # Get project root directory
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.dirname(current_dir)
+            audio_files_dir = os.path.join(project_root, "audio_files")
+            
+            if not os.path.exists(audio_files_dir):
+                print(f"Creating audio_files directory: {audio_files_dir}")
+                os.makedirs(audio_files_dir, exist_ok=True)
+                print("Audio files directory created. Add audio files to get started.")
+                return
+            
+            # Supported audio formats
+            supported_formats = ['.wav', '.mp3', '.ogg', '.flac', '.m4a', '.aiff', '.mp4', '.wma']
+            
+            # Load each audio file
+            loaded_count = 0
+            for filename in sorted(os.listdir(audio_files_dir)):
+                if any(filename.lower().endswith(fmt) for fmt in supported_formats):
+                    file_path = os.path.join(audio_files_dir, filename)
+                    
+                    try:
+                        # Create friendly name from filename
+                        name = os.path.splitext(filename)[0].replace('_', ' ').replace('-', ' ').title()
+                        # Clean up common frequency patterns
+                        name = name.replace('Hz', 'Hz').replace('hz', 'Hz')
+                        
+                        # Register the audio file
+                        source_id = self.register_audio_file(name, file_path)
+                        print(f"Loaded: {name}")
+                        loaded_count += 1
+                        
+                    except Exception as e:
+                        print(f"Failed to load audio file {filename}: {e}")
+                        
+            # Show final count
+            if loaded_count > 0:
+                print(f"Successfully loaded {loaded_count} audio files from audio_files directory")
+            else:
+                print("No audio files found in audio_files directory. Upload some audio files to get started.")
+                
+        except Exception as e:
+            print(f"Error loading project audio files: {e}")
+    
+    def _reload_project_audio_files(self):
+        """Reload all audio files from the project directory"""
+        print("Reloading audio files from audio_files directory...")
+        self._load_project_audio_files()
+    
     def _generate_square_wave(self, frequency: float, duration: float) -> np.ndarray:
         """Generate a square wave"""
         samples = int(self.sample_rate * duration)
@@ -175,11 +234,53 @@ class SpatialAudioEngine:
         """Real-time audio mixing worker thread"""
         while self.running:
             try:
+                # Always check for finished audio, regardless of mixing mode
+                self._check_finished_audio()
+                
                 if self.mixing_enabled and self.channels:
                     self._process_active_channels()
-                time.sleep(0.05)  # 20Hz update rate for smooth mixing
+                time.sleep(0.1)  # 10Hz update rate for checking finished audio
             except Exception as e:
                 print(f"Mixing worker error: {e}")
+    
+    def _check_finished_audio(self):
+        """Check for finished audio and start pending audio if available"""
+        current_time = time.time()
+        
+        for channel in self.channels.values():
+            if not channel.is_enabled:
+                continue
+                
+            # Check if current audio has finished
+            if channel.audio_start_time > 0:
+                time_since_start = current_time - channel.audio_start_time
+                
+                if time_since_start >= channel.audio_duration:
+                    # Audio finished!
+                    print(f"✅ Audio finished for device {channel.device_id}: {channel.audio_source.name}")
+                    
+                    # Check if we have pending parameters (new distance-based audio)
+                    if (channel.pending_volume is not None or 
+                        channel.pending_frequency is not None or
+                        current_time - channel.last_update < 2.0):  # Recent distance update
+                        
+                        # Apply pending parameters
+                        if channel.pending_volume is not None:
+                            channel.current_volume = channel.pending_volume
+                            channel.pending_volume = None
+                        
+                        if channel.pending_frequency is not None:
+                            channel.current_frequency = channel.pending_frequency
+                            channel.pending_frequency = None
+                        
+                        # Start new audio cycle with current parameters
+                        print(f"🔄 Starting next audio cycle for device {channel.device_id}")
+                        self._start_audio_playback(channel, 0.5)  # Default duration for distance-based audio
+                    else:
+                        # No pending updates, mark as not playing
+                        channel.is_playing = False
+                        channel.audio_start_time = 0.0
+                        channel.audio_duration = 0.0
                 
     def _process_active_channels(self):
         """Process and mix active audio channels"""
@@ -318,15 +419,52 @@ class SpatialAudioEngine:
     def _generate_file_audio(self, audio_source: AudioSource, duration: float) -> Optional[np.ndarray]:
         """Generate audio from file source"""
         if not audio_source.file_path or not os.path.exists(audio_source.file_path):
+            print(f"File not found: {audio_source.file_path}")
             return None
         
         try:
-            # Load audio file (simplified - in practice, you'd want more robust loading)
+            # CRITICAL FIX: Actually play the loaded audio file!
             sound = pygame.mixer.Sound(audio_source.file_path)
-            # For now, fall back to sine wave
-            return self._generate_sine_wave_audio(440.0, duration)
+            
+            # Get the raw audio array from the pygame sound
+            array = pygame.sndarray.array(sound)
+            
+            # Convert to float32 for processing
+            if array.dtype == np.int16:
+                audio_data = array.astype(np.float32) / 32767.0
+            elif array.dtype == np.int32:
+                audio_data = array.astype(np.float32) / 2147483647.0
+            else:
+                audio_data = array.astype(np.float32)
+            
+            # Handle stereo to mono conversion if needed
+            if len(audio_data.shape) > 1 and audio_data.shape[1] > 1:
+                audio_data = np.mean(audio_data, axis=1)
+            
+            # Trim or repeat audio to match requested duration
+            samples_needed = int(self.sample_rate * duration)
+            current_samples = len(audio_data)
+            
+            if current_samples >= samples_needed:
+                # Trim to requested duration
+                audio_data = audio_data[:samples_needed]
+            else:
+                # Repeat the audio to fill the duration
+                repeats = (samples_needed // current_samples) + 1
+                audio_data = np.tile(audio_data, repeats)[:samples_needed]
+            
+            print(f"🎵 Playing file audio: {audio_source.name} ({duration:.1f}s, {len(audio_data)} samples)")
+            return audio_data
+            
         except Exception as e:
             print(f"File audio generation error: {e}")
+            # Fallback to direct pygame playback
+            try:
+                sound = pygame.mixer.Sound(audio_source.file_path)
+                sound.play()
+                print(f"🔊 Fallback: Playing {audio_source.name} directly via pygame")
+            except Exception as e2:
+                print(f"Fallback playback failed: {e2}")
             return None
             
     def register_audio_file(self, file_name: str, file_path: str) -> str:
@@ -349,45 +487,116 @@ class SpatialAudioEngine:
         
     def synthesize_audio(self, device_id: str, frequency: float, volume: float, 
                         audio_file: Optional[str] = None, duration: float = 0.5):
-        """Synthesize audio for a specific device with enhanced real-time mixing"""
+        """Synthesize audio for a specific device with play-to-completion logic"""
         if not self.enabled:
             return
             
         try:
+            # Get the requested audio source
+            source_id = audio_file or "sine_440"
+            audio_source = self.audio_sources.get(source_id)
+            
+            if not audio_source:
+                print(f"Audio source not found: {source_id}, using default")
+                if self.audio_sources:
+                    audio_source = list(self.audio_sources.values())[0]
+                else:
+                    print("No audio sources available!")
+                    return
+            
+            current_time = time.time()
+            
             # Get or create audio channel
             if device_id not in self.channels:
-                # Default to first sine wave if no audio file specified
-                source_id = audio_file or "sine_440"
-                audio_source = self.audio_sources.get(source_id)
-                
-                if not audio_source:
-                    print(f"Audio source not found: {source_id}, using default")
-                    audio_source = list(self.audio_sources.values())[0]
-                    
+                # Create new channel
                 self.channels[device_id] = AudioChannel(
                     device_id=device_id,
                     audio_source=audio_source,
                     current_volume=volume,
                     current_frequency=frequency,
                     is_playing=False,
-                    last_update=time.time(),
-                    is_enabled=True
+                    last_update=current_time,
+                    is_enabled=True,
+                    audio_start_time=0.0,
+                    audio_duration=0.0,
+                    pending_volume=None,
+                    pending_frequency=None
                 )
+                # Start playing immediately for new channels
+                self._start_audio_playback(self.channels[device_id], duration)
+            else:
+                channel = self.channels[device_id]
                 
-            channel = self.channels[device_id]
-            
-            # Update channel parameters
-            channel.current_volume = volume
-            channel.current_frequency = frequency
-            channel.last_update = time.time()
-            channel.is_playing = True
-            
-            # If real-time mixing is disabled, play individual sounds
-            if not self.mixing_enabled:
-                self._play_individual_sound(channel, duration)
+                # Check if current audio is still playing
+                time_since_start = current_time - channel.audio_start_time
+                is_audio_finished = (channel.audio_start_time == 0.0 or 
+                                   time_since_start >= channel.audio_duration)
+                
+                if is_audio_finished:
+                    # Audio finished or not playing - start new audio immediately
+                    channel.audio_source = audio_source
+                    channel.current_volume = volume
+                    channel.current_frequency = frequency
+                    channel.last_update = current_time
+                    
+                    print(f"🎵 Device {device_id}: Starting '{audio_source.name}' (ID: {audio_source.id}) at volume {volume:.2f}")
+                    self._start_audio_playback(channel, duration)
+                else:
+                    # Audio still playing - store pending parameters
+                    channel.pending_volume = volume
+                    channel.pending_frequency = frequency
+                    channel.last_update = current_time
+                    
+                    # Update audio source if it changed
+                    if channel.audio_source.id != audio_source.id:
+                        channel.audio_source = audio_source
+                        print(f"🔄 Device {device_id}: Audio source changed to '{audio_source.name}' (will apply after current audio finishes)")
+                    
+                    # Debug: Show remaining time
+                    remaining_time = channel.audio_duration - time_since_start
+                    print(f"⏳ Device {device_id}: Audio playing, {remaining_time:.1f}s remaining")
                 
         except Exception as e:
             print(f"Audio synthesis error: {e}")
+    
+    def _start_audio_playback(self, channel: AudioChannel, duration: float):
+        """Start audio playback for a channel and set timing information"""
+        try:
+            # Determine actual audio duration
+            if channel.audio_source.file_type == AudioFileType.AUDIO_FILE:
+                actual_duration = self._get_audio_file_duration(channel.audio_source)
+                if actual_duration is None:
+                    actual_duration = duration  # Fallback to requested duration
+            else:
+                actual_duration = duration  # For synthesized audio, use requested duration
+            
+            # Update channel timing
+            channel.audio_start_time = time.time()
+            channel.audio_duration = actual_duration
+            channel.is_playing = True
+            
+            print(f"🎬 Starting audio: {channel.audio_source.name} ({actual_duration:.1f}s duration)")
+            
+            # Play the audio
+            if not self.mixing_enabled:
+                self._play_individual_sound(channel, actual_duration)
+                
+        except Exception as e:
+            print(f"Audio playback start error: {e}")
+    
+    def _get_audio_file_duration(self, audio_source: AudioSource) -> Optional[float]:
+        """Get the duration of an audio file in seconds"""
+        if not audio_source.file_path or not os.path.exists(audio_source.file_path):
+            return None
+        
+        try:
+            # Load the sound to get its length
+            sound = pygame.mixer.Sound(audio_source.file_path)
+            # Get duration in seconds (pygame returns samples, need to convert)
+            return sound.get_length()
+        except Exception as e:
+            print(f"Failed to get audio duration for {audio_source.name}: {e}")
+            return None
     
     def _play_individual_sound(self, channel: AudioChannel, duration: float):
         """Play individual sound for a channel (fallback mode)"""
@@ -431,7 +640,11 @@ class SpatialAudioEngine:
                 current_frequency=audio_source.frequency or 440.0,
                 is_playing=False,
                 last_update=time.time(),
-                is_enabled=True
+                is_enabled=True,
+                audio_start_time=0.0,
+                audio_duration=0.0,
+                pending_volume=None,
+                pending_frequency=None
             )
             
         print(f"Assigned {audio_source.name} to device {device_id}")
