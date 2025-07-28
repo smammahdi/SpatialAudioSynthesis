@@ -13,6 +13,8 @@ import asyncio
 import json
 from typing import Dict, List, Optional, Callable, Tuple, Any
 from dataclasses import dataclass
+
+from .config import Config
 from enum import Enum
 import serial
 import serial.tools.list_ports
@@ -40,6 +42,14 @@ except ImportError:
         print("❌ No Bluetooth library available")
         print("   Install with: pip install bleak")
         print("   Alternative: pip install pybluez")
+        BLUETOOTH_AVAILABLE = False
+        BLUETOOTH_LIBRARY = None
+        
+        # Define dummy classes for type checking when Bluetooth is not available
+        class BleakClient:
+            pass
+        class BleakScanner:
+            pass
 
 class DeviceStatus(Enum):
     DISCONNECTED = "disconnected"
@@ -63,17 +73,48 @@ class Device:
     device_type: str = "unknown"  # "bluetooth", "serial", "demo"
     rssi: Optional[int] = None  # Signal strength
     manufacturer_data: Optional[Dict] = None
+    # Moving object specific fields
+    last_orientation: Optional[float] = None  # Orientation in degrees
+    orientation_updated: bool = False  # Flag to indicate new orientation data
 
 class BluetoothDeviceInfo:
     """Container for Bluetooth device information with bleak compatibility"""
     def __init__(self, address: str, name: str, rssi: int = 0, manufacturer_data: Dict = None):
         self.address = address
         self.name = name if name else f"Device-{address[-5:].replace(':', '')}"
+        self.device_name = self.name  # For UI manager compatibility
         self.rssi = rssi
         self.manufacturer_data = manufacturer_data or {}
         self.device = address  # For compatibility
         self.description = f"Bluetooth BLE Device - {self.name}"
         self.is_bluetooth = True
+
+def safe_get_rssi(device) -> int:
+    """Safely extract RSSI from BLE device across different bleak versions"""
+    try:
+        # Direct attribute access (most common)
+        if hasattr(device, 'rssi') and device.rssi is not None:
+            return device.rssi
+        
+        # Metadata access (some versions)
+        if hasattr(device, 'metadata') and device.metadata:
+            if isinstance(device.metadata, dict):
+                return device.metadata.get('rssi', 0)
+            elif hasattr(device.metadata, 'get'):
+                return device.metadata.get('rssi', 0)
+        
+        # Details access (rare cases)
+        if hasattr(device, 'details') and hasattr(device.details, 'rssi'):
+            return device.details.rssi
+        
+        # Advertisement data access (alternative)
+        if hasattr(device, 'advertisement_data') and hasattr(device.advertisement_data, 'rssi'):
+            return device.advertisement_data.rssi
+            
+    except Exception as e:
+        print(f"RSSI extraction error for device {getattr(device, 'address', 'unknown')}: {e}")
+    
+    return 0  # Default fallback
 
 class DeviceManager:
     """Enhanced Device Manager with HC-05 Bluetooth Support using proven patterns"""
@@ -84,6 +125,11 @@ class DeviceManager:
         self.demo_mode = False
         self.scanning = False
         self.demo_device_counter = 0  # For generating unique demo device IDs
+        
+        # Demo pattern settings
+        self.demo_pattern = 'linear'  # 'linear', 'sinusoidal', 'random'
+        self.demo_speed = 1.0         # Pattern speed multiplier
+        self.demo_amplitude = 170.0   # Distance range amplitude
         
         # Callbacks
         self.on_device_connected: Optional[Callable[[str, str], None]] = None
@@ -188,7 +234,8 @@ class DeviceManager:
                 )
                 
                 # Also include devices with strong signal (likely nearby sensors)
-                is_nearby = device.rssi and device.rssi > -75
+                device_rssi = safe_get_rssi(device)
+                is_nearby = device_rssi and device_rssi > -75
                 
                 # More permissive filtering for HC-05 devices
                 is_potential_sensor = any(keyword in device_name.lower() for keyword in [
@@ -199,22 +246,22 @@ class DeviceManager:
                     bt_device = BluetoothDeviceInfo(
                         address=device.address,
                         name=device_name,
-                        rssi=device.rssi or 0,
+                        rssi=device_rssi,
                         manufacturer_data=device.metadata.get('manufacturer_data', {})
                     )
                     bluetooth_devices.append(bt_device)
                     
-                    print(f"📱 Found HC-05 compatible device: {device_name} ({device.address}) RSSI: {device.rssi}dBm")
-                elif device.rssi and device.rssi > -60:  # Very strong signal
+                    print(f"📱 Found HC-05 compatible device: {device_name} ({device.address}) RSSI: {device_rssi}dBm")
+                elif device_rssi and device_rssi > -60:  # Very strong signal
                     # Include very nearby devices regardless of name
                     bt_device = BluetoothDeviceInfo(
                         address=device.address,
                         name=device_name,
-                        rssi=device.rssi or 0,
+                        rssi=device_rssi,
                         manufacturer_data=device.metadata.get('manufacturer_data', {})
                     )
                     bluetooth_devices.append(bt_device)
-                    print(f"📱 Found nearby device: {device_name} ({device.address}) RSSI: {device.rssi}dBm")
+                    print(f"📱 Found nearby device: {device_name} ({device.address}) RSSI: {device_rssi}dBm")
             
             print(f"✅ HC-05 scan complete. Found {len(bluetooth_devices)} compatible devices")
             return bluetooth_devices
@@ -305,6 +352,7 @@ class DeviceManager:
                 print(f"   - RSSI: {device_info.rssi}dBm")
                 
                 device.status = DeviceStatus.CONNECTED
+                print(f"✅ Device {device.device_name} status set to CONNECTED (type: {device.device_type})")
                 self.bluetooth_clients[device.device_id] = client
                 
                 if self.on_device_connected:
@@ -423,7 +471,11 @@ class DeviceManager:
                         print(f"📦 RAW DATA from {device.device_name}: '{raw_data}' (bytes: {len(data)})")
                         
                         if raw_data:  # Only process non-empty messages
-                            self._process_hc05_data(device.device_id, raw_data)
+                            # Route to appropriate data processor based on device type
+                            if device.device_type == "moving_object":
+                                self._process_moving_object_data(device.device_id, raw_data)
+                            else:
+                                self._process_hc05_data(device.device_id, raw_data)
                     except Exception as e:
                         # Log error but continue running - don't crash the app
                         print(f"⚠️  Data processing error from {device.device_name}: {e}")
@@ -562,6 +614,91 @@ class DeviceManager:
             # Don't print traceback - just log and continue
             # App continues running
 
+    def _process_moving_object_data(self, device_id: str, data: str):
+        """Process moving object data (angle/orientation only)"""
+        try:
+            # Get friendly device name for logging
+            device = self.devices.get(device_id)
+            device_name = device.device_name if device else device_id
+            
+            print(f"🚗 Processing moving object data from {device_name}: '{data}'")
+            
+            # Handle startup message
+            if "MovingObject Online" in data or "BluetoothCar Online" in data:
+                print(f"✅ {device_name} moving object startup message received")
+                return
+            
+            orientation = None
+            
+            # Try to parse JSON format with angle: {"angle": 45.0}
+            if data.startswith('{') and data.endswith('}'):
+                try:
+                    json_data = json.loads(data)
+                    if 'angle' in json_data:
+                        orientation = float(json_data['angle'])
+                        print(f"📊 Parsed JSON angle from {device_name}: {orientation}°")
+                    elif 'orientation' in json_data:
+                        orientation = float(json_data['orientation'])
+                        print(f"📊 Parsed JSON orientation from {device_name}: {orientation}°")
+                except Exception as e:
+                    print(f"⚠️  Moving object JSON parsing failed for {device_name}: {e}")
+            
+            # Try simple angle value like "45.0" or "  45.0"
+            if orientation is None:
+                try:
+                    # Clean up the string - remove whitespace and try to parse
+                    clean_data = data.strip()
+                    orientation = float(clean_data)
+                    print(f"📊 Parsed simple angle from {device_name}: {orientation}°")
+                except ValueError as e:
+                    print(f"⚠️  Simple angle parsing failed for {device_name} '{clean_data}': {e}")
+            
+            # Validate orientation range and update
+            if orientation is not None:
+                # Normalize angle to 0-360 range
+                orientation = orientation % 360
+                self._update_moving_object_orientation(device_id, orientation)
+                print(f"✅ Valid orientation from {device_name}: {orientation}°")
+            else:
+                print(f"❌ Could not parse orientation from {device_name}: '{data}' - expected angle value or JSON")
+            
+        except Exception as e:
+            device = self.devices.get(device_id)
+            device_name = device.device_name if device else device_id
+            print(f"⚠️  Moving object data processing error for {device_name} '{data}': {e}")
+            print(f"📝 Error details: {type(e).__name__}")
+
+    def _update_moving_object_orientation(self, device_id: str, orientation: float):
+        """Update moving object orientation only"""
+        try:
+            device = self.devices.get(device_id)
+            if not device:
+                print(f"❌ Moving object device {device_id} not found")
+                return
+            
+            # Update device orientation data
+            device.last_orientation = orientation
+            device.orientation_updated = True  # Flag that new orientation data is available
+            device.connection_time = time.time()
+            
+            print(f"✅ Updated moving object {device.device_name}: orientation={orientation:.1f}°")
+            
+        except Exception as e:
+            print(f"⚠️  Failed to update moving object orientation: {e}")
+
+    def get_moving_object_updates(self) -> List[Tuple[str, float]]:
+        """Get all pending moving object orientation updates and clear the flags"""
+        updates = []
+        for device_id, device in self.devices.items():
+            if (device.device_type == "moving_object" and 
+                device.orientation_updated and 
+                device.last_orientation is not None):
+                
+                updates.append((device_id, device.last_orientation))
+                device.orientation_updated = False  # Clear the flag
+        
+        return updates
+
     async def _simulate_hc05_data(self, device: Device):
         """Simulate HC-05 data for testing when real connection fails"""
         print(f"🎭 Simulating HC-05 data for {device.device_name}")
@@ -605,13 +742,17 @@ class DeviceManager:
 
         print(f"🔗 Initiating HC-05 connection to {device_info.name}...")
         
+        # Check if this is a moving object device
+        is_moving_object = getattr(device_info, 'is_moving_object', False)
+        device_type = "moving_object" if is_moving_object else "bluetooth"
+        
         device = Device(
             device_id=device_id,
             device_name=device_info.name,
             status=DeviceStatus.CONNECTING,
             connection_time=time.time(),
             connection_info=device_info.address,
-            device_type="bluetooth",
+            device_type=device_type,
             rssi=device_info.rssi
         )
         
@@ -930,17 +1071,36 @@ class DeviceManager:
             
             # Each device has its own unique pattern
             device_seed = hash(device_id) % 1000
-            base_frequency = 0.1 + (device_seed % 5) * 0.05  # Different cycle speeds
+            base_frequency = (0.1 + (device_seed % 5) * 0.05) * self.demo_speed  # Different cycle speeds with speed control
             base_offset = (device_seed % 10) * 3.0  # Different starting phases
+            start_time = time.time()  # For linear pattern
             
             while (self.demo_mode and self.running and 
                    device_id in self.demo_devices and 
                    device_id in self.devices):
                 
-                # Generate unique pattern for each device
-                cycle_progress = (time.time() * base_frequency) % (2 * math.pi)
-                base_distance = 0.5 * (1 - math.cos(cycle_progress + base_offset))
-                distance = max(5.0, min(175.0, base_distance * 170.0 + random.uniform(-3.0, 3.0)))
+                # Generate distance based on selected pattern
+                if self.demo_pattern == 'linear':
+                    # Linear back-and-forth pattern
+                    elapsed = (time.time() - start_time) * base_frequency
+                    # Create triangle wave (0 to 1 to 0 to 1...)
+                    cycle_pos = (elapsed % 2.0)  # 0 to 2
+                    if cycle_pos <= 1.0:
+                        base_distance = cycle_pos  # 0 to 1
+                    else:
+                        base_distance = 2.0 - cycle_pos  # 1 to 0
+                elif self.demo_pattern == 'sinusoidal':
+                    # Original sinusoidal pattern
+                    cycle_progress = (time.time() * base_frequency) % (2 * math.pi)
+                    base_distance = 0.5 * (1 - math.cos(cycle_progress + base_offset))
+                else:  # random
+                    # Random walk pattern
+                    current_distance = device.last_distance if device.last_distance else 50.0
+                    change = random.uniform(-10.0, 10.0) * self.demo_speed
+                    base_distance = max(0.0, min(1.0, (current_distance + change) / self.demo_amplitude))
+                
+                # Apply amplitude and add noise
+                distance = max(5.0, min(175.0, base_distance * self.demo_amplitude + random.uniform(-3.0, 3.0)))
                 
                 self._update_device_distance(device_id, distance)
                 time.sleep(0.2)  # 5Hz update rate
@@ -1012,3 +1172,28 @@ class DeviceManager:
             self.loop.call_soon_threadsafe(self.loop.stop)
         
         print("✅ Device manager cleanup complete")
+    
+    def update_demo_settings(self, pattern: str = None, speed: float = None, amplitude: float = None):
+        """Update demo pattern settings"""
+        if pattern and pattern in ['linear', 'sinusoidal', 'random']:
+            self.demo_pattern = pattern
+            if Config.DEBUG.get('PRINT_UI_INTERACTIONS', True):
+                print(f"Demo Settings: Pattern changed to {pattern}")
+        
+        if speed is not None and 0.1 <= speed <= 5.0:
+            self.demo_speed = speed
+            if Config.DEBUG.get('PRINT_UI_INTERACTIONS', True):
+                print(f"Demo Settings: Speed changed to {speed:.1f}x")
+        
+        if amplitude is not None and 50.0 <= amplitude <= 300.0:
+            self.demo_amplitude = amplitude
+            if Config.DEBUG.get('PRINT_UI_INTERACTIONS', True):
+                print(f"Demo Settings: Amplitude changed to {amplitude:.0f}cm")
+    
+    def get_demo_settings(self) -> dict:
+        """Get current demo settings"""
+        return {
+            'pattern': self.demo_pattern,
+            'speed': self.demo_speed,
+            'amplitude': self.demo_amplitude
+        }

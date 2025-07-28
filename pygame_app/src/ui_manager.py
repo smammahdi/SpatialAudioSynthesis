@@ -5,6 +5,7 @@ Enhanced UI Manager with HC-05 Integration and Improved Layout
 import pygame
 import pygame.freetype
 import time
+import math
 from typing import Dict, List, Optional, Callable, Tuple, Any
 from enum import Enum
 
@@ -12,11 +13,19 @@ from .config import Config
 from .audio_engine import SpatialAudioEngine, AudioSource, AudioFileType
 from .device_manager import DeviceManager, Device, DeviceStatus
 from .device_scanner import DeviceScanner
+from .distance_mapping_editor import DistanceMappingEditor
+from .simulation_page import SimulationPage, Point2D
+
+# Debug flags from config
+DEBUG_UI = Config.DEBUG.get('PRINT_UI_INTERACTIONS', True)
+DEBUG_AUDIO = Config.DEBUG.get('PRINT_AUDIO_EVENTS', True)
+DEBUG_DEVICES = Config.DEBUG.get('PRINT_DEVICE_SCANNING', True)
+DEBUG_FILES = Config.DEBUG.get('PRINT_FILE_OPERATIONS', True)
 
 class NavigationPage(Enum):
     HOME = "Home"
-    DEVICES = "Devices"
-    AUDIO = "Audio"
+    SIMULATION = "Simulation"
+    SETTINGS = "Settings"
 
 class UIManager:
     def __init__(self, screen: pygame.Surface, audio_engine: SpatialAudioEngine, device_manager: DeviceManager):
@@ -31,6 +40,10 @@ class UIManager:
         
         pygame.freetype.init()
         self.fonts = self._load_fonts()
+        
+        # Initialize page components
+        self.distance_mapping_editor = None
+        self.simulation_page = None
         
         # UI State
         self.expanded_sections = {
@@ -51,7 +64,15 @@ class UIManager:
         }
         self.distance_settings = {
             'min_distance': 5.0, 'max_distance': 150.0, 'min_volume': 5.0, 
-            'max_volume': 100.0, 'decay_type': 'exponential', 'max_graph_distance': 200.0
+            'max_volume': 100.0, 'decay_type': 'exponential', 'max_graph_distance': 200.0,
+            'data_history_duration': 60.0  # seconds of data to display on charts
+        }
+        
+        # Demo device settings
+        self.demo_settings = {
+            'pattern': 'linear',  # 'linear', 'sinusoidal', 'random'
+            'speed': 1.0,         # Pattern speed multiplier
+            'amplitude': 170.0    # Distance range amplitude
         }
         
         # Data tracking settings
@@ -71,6 +92,10 @@ class UIManager:
         
         # Global audio control
         self.global_audio_enabled = True
+        
+        # Moving object device management
+        self.moving_object_device = None  # Currently connected moving object device
+        self.demo_moving_object_enabled = False  # Demo moving object state
         
         # Data tracking
         self.log_entries: List[Tuple[float, str, str]] = []
@@ -95,9 +120,10 @@ class UIManager:
         self.device_manager.on_device_disconnected = self._on_device_disconnected
         self.device_manager.on_distance_update = self._on_distance_update
         
-        self.add_log_entry("Enhanced UI Manager with HC-05 support initialized", "success")
-        if self.hc05_status['available']:
-            self.add_log_entry(f"HC-05 Bluetooth support: {self.hc05_status['library']}", "info")
+        if DEBUG_UI:
+            self.add_log_entry("UI Manager: Enhanced HC-05 support initialized", "success")
+            if self.hc05_status['available']:
+                self.add_log_entry(f"UI Manager: Bluetooth support - {self.hc05_status['library']}", "info")
         else:
             self.add_log_entry("HC-05 Bluetooth not available - using demo mode only", "warning")
 
@@ -195,9 +221,19 @@ class UIManager:
             self.mouse_pos = event.pos
             self._handle_slider_drag(event.pos)
             self._handle_hover(event.pos)
+            # Forward mouse motion to simulation page for node dragging
+            if (self.current_page == 'simulation' and 
+                hasattr(self.simulation_page, 'handle_event')):
+                self.simulation_page.handle_event(event)
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if time.time() - self.last_click_time > 0.2:
-                self._handle_click(event.pos)
+                # First, check if simulation page should handle this click
+                if (self.current_page == 'simulation' and 
+                    hasattr(self.simulation_page, 'handle_event') and
+                    event.pos[0] > 300):  # Only forward clicks on the simulation area (right side)
+                    self.simulation_page.handle_event(event)
+                else:
+                    self._handle_click(event.pos)
                 self.last_click_time = time.time()
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 4:  # Mouse wheel up
             self._handle_scroll(1, 0)
@@ -205,17 +241,35 @@ class UIManager:
             self._handle_scroll(-1, 0)
         elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
             self.dragging_slider = None
+            # Forward mouse button up to simulation page for ending drag operations
+            if (self.current_page == 'simulation' and 
+                hasattr(self.simulation_page, 'handle_event')):
+                self.simulation_page.handle_event(event)
         elif event.type == pygame.MOUSEWHEEL:
             self._handle_scroll(event.y, event.x if hasattr(event, 'x') else 0)
         elif event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_UP:
-                self._handle_scroll(1, 0)
-            elif event.key == pygame.K_DOWN:
-                self._handle_scroll(-1, 0)
-            elif event.key == pygame.K_PAGEUP:
-                self._handle_scroll(3, 0)
-            elif event.key == pygame.K_PAGEDOWN:
-                self._handle_scroll(-3, 0)
+            # Forward keyboard events to simulation page if it's active and let it handle them first
+            handled_by_sim = False
+            if self.current_page == 'simulation' and hasattr(self.simulation_page, 'handle_event'):
+                # Let simulation page handle the event first (especially for arrow keys when demo is active)
+                if (hasattr(self.simulation_page, 'demo_moving_object') and 
+                    self.simulation_page.demo_moving_object.get('enabled', False) and
+                    event.key in [pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN]):
+                    self.simulation_page.handle_event(event)
+                    handled_by_sim = True
+                else:
+                    self.simulation_page.handle_event(event)
+            
+            # Only handle scrolling if simulation page didn't handle it
+            if not handled_by_sim:
+                if event.key == pygame.K_UP:
+                    self._handle_scroll(1, 0)
+                elif event.key == pygame.K_DOWN:
+                    self._handle_scroll(-1, 0)
+                elif event.key == pygame.K_PAGEUP:
+                    self._handle_scroll(3, 0)
+                elif event.key == pygame.K_PAGEDOWN:
+                    self._handle_scroll(-3, 0)
 
     def _handle_scroll(self, y_scroll: int, x_scroll: int):
         """Handle mouse wheel scrolling for multiple scrollable areas"""
@@ -226,7 +280,7 @@ class UIManager:
         scroll_areas = getattr(self, 'scroll_areas', {})
         
         # Check audio library scrolling (on AUDIO page)
-        if (self.current_page == NavigationPage.AUDIO and 
+        if (self.current_page == NavigationPage.SETTINGS and 
             'audio_library' in scroll_areas and 
             scroll_areas['audio_library'].collidepoint(self.mouse_pos)):
             
@@ -299,10 +353,10 @@ class UIManager:
         # Handle page-specific clicks
         if self.current_page == NavigationPage.HOME:
             self._handle_home_click(pos)
-        elif self.current_page == NavigationPage.DEVICES:
-            self._handle_devices_click(pos)
-        elif self.current_page == NavigationPage.AUDIO:
-            self._handle_audio_click(pos)
+        elif self.current_page == NavigationPage.SIMULATION:
+            self._handle_simulation_click(pos)
+        elif self.current_page == NavigationPage.SETTINGS:
+            self._handle_settings_click(pos)
 
     def _handle_home_click(self, pos: Tuple[int, int]):
         # Device management buttons
@@ -323,7 +377,7 @@ class UIManager:
         if 'global_audio_toggle' in self.button_rects and self.button_rects['global_audio_toggle'].collidepoint(pos):
             self.global_audio_enabled = not self.global_audio_enabled
             status_text = "enabled" if self.global_audio_enabled else "disabled"
-            self.add_log_entry(f"🔊 Global audio {status_text}", "success" if self.global_audio_enabled else "warning")
+            self.add_log_entry(f"Audio System: {status_text}", "success" if self.global_audio_enabled else "warning")
             return
 
         # Demo device management buttons
@@ -337,6 +391,30 @@ class UIManager:
 
         if 'clear_demo_devices' in self.button_rects and self.button_rects['clear_demo_devices'].collidepoint(pos):
             self._clear_demo_devices()
+            return
+
+        # Moving object device management buttons
+        if 'scan_moving_object' in self.button_rects and self.button_rects['scan_moving_object'].collidepoint(pos):
+            self._scan_for_moving_object_devices()
+            return
+
+        if 'demo_moving_toggle' in self.button_rects and self.button_rects['demo_moving_toggle'].collidepoint(pos):
+            self.demo_moving_object_enabled = not self.demo_moving_object_enabled
+            if self.demo_moving_object_enabled:
+                self.add_log_entry("Demo moving object enabled", "success")
+                # Sync with simulation page
+                if hasattr(self, 'simulation_page') and self.simulation_page:
+                    self.simulation_page.demo_moving_object['enabled'] = True
+                    self.simulation_page.demo_moving_object['position'] = Point2D(
+                        self.simulation_page.grid_range_x / 2, 
+                        self.simulation_page.grid_range_y / 2
+                    )
+                    self.simulation_page.demo_moving_object['orientation'] = 0.0
+            else:
+                self.add_log_entry("Demo moving object disabled")
+                # Sync with simulation page
+                if hasattr(self, 'simulation_page') and self.simulation_page:
+                    self.simulation_page.demo_moving_object['enabled'] = False
             return
 
         # Audio assignment dropdown clicks
@@ -380,7 +458,7 @@ class UIManager:
                         
                         # If only one audio source, suggest uploading more
                         if len(audio_sources) <= 1:
-                            self.add_log_entry("📁 Upload more audio files to have assignment options!", "info")
+                            self.add_log_entry("File Manager: Upload more audio files for assignment options", "info")
                             self.add_log_entry("💡 Go to Audio page and click 'Upload Audio File'", "info")
                             # Optionally trigger upload directly
                             self._handle_audio_upload()
@@ -485,10 +563,47 @@ class UIManager:
             # Ensure screen is restored even on error
             pygame.display.set_mode(self.original_screen_size)
 
+    def _scan_for_moving_object_devices(self):
+        """Scan for moving object devices (similar to HC-05 but specifically for moving objects)"""
+        self.add_log_entry("Scanning for moving object devices...")
+        try:
+            # Store current screen mode
+            current_mode = pygame.display.get_surface()
+            
+            scanner = DeviceScanner(self.screen, device_type="Moving Object")
+            selected_device = scanner.run()
+            
+            # Restore original screen mode properly
+            pygame.display.set_mode(self.original_screen_size)
+            
+            if selected_device:
+                device_name = getattr(selected_device, 'name', getattr(selected_device, 'device', 'Unknown'))
+                self.add_log_entry(f"Moving object device selected: {device_name}", "info")
+                
+                # Store as moving object device
+                self.moving_object_device = selected_device
+                
+                # Actually connect to the device using the device manager
+                try:
+                    self.add_log_entry(f"Connecting to moving object device: {device_name}...", "info")
+                    # Mark this device as a moving object before connecting
+                    selected_device.is_moving_object = True
+                    self.device_manager.connect_to_device(selected_device)
+                    self.add_log_entry(f"Moving object device connection initiated: {device_name}", "success")
+                except Exception as e:
+                    self.add_log_entry(f"Failed to connect to moving object device: {e}", "error")
+            else:
+                self.add_log_entry("Moving object device selection cancelled.", "info")
+                
+        except Exception as e:
+            self.add_log_entry(f"Moving object scanner error: {e}", "error")
+            # Ensure screen is restored even on error
+            pygame.display.set_mode(self.original_screen_size)
+
     def _add_demo_device(self):
         """Add a new demo device"""
         if not self.device_manager.demo_mode:
-            self.add_log_entry("❌ Demo mode must be enabled first", "error")
+            self.add_log_entry("Demo Mode: Must be enabled first", "error")
             return
         
         try:
@@ -497,32 +612,32 @@ class UIManager:
             if device_id:
                 device = self.device_manager.devices.get(device_id)
                 device_name = device.device_name if device else f"Demo Device {self.device_manager.demo_device_counter}"
-                self.add_log_entry(f"✅ Added demo device: {device_name}", "success")
+                self.add_log_entry(f"Demo Mode: Added device - {device_name}", "success")
             else:
-                self.add_log_entry("❌ Failed to add demo device", "error")
+                self.add_log_entry("Demo Mode: Failed to add device", "error")
             
         except Exception as e:
-            self.add_log_entry(f"❌ Failed to add demo device: {str(e)}", "error")
+            self.add_log_entry(f"Demo Mode: Failed to add device: {str(e)}", "error")
 
     def _remove_demo_device(self):
         """Remove the most recent demo device"""
         if not self.device_manager.demo_mode:
-            self.add_log_entry("❌ Demo mode must be enabled first", "error")
+            self.add_log_entry("Demo Mode: Must be enabled first", "error")
             return
         
         try:
             # Use the device manager's new method
             success = self.device_manager.remove_demo_device()
             if not success:
-                self.add_log_entry("⚠️ No demo devices to remove", "warning")
+                self.add_log_entry("Demo Mode: No devices to remove", "warning")
             
         except Exception as e:
-            self.add_log_entry(f"❌ Failed to remove demo device: {str(e)}", "error")
+            self.add_log_entry(f"Demo Mode: Failed to remove device - {str(e)}", "error")
 
     def _clear_demo_devices(self):
         """Remove all demo devices"""
         if not self.device_manager.demo_mode:
-            self.add_log_entry("❌ Demo mode must be enabled first", "error")
+            self.add_log_entry("Demo Mode: Must be enabled first", "error")
             return
         
         try:
@@ -530,13 +645,13 @@ class UIManager:
             self.device_manager.clear_all_demo_devices()
             
         except Exception as e:
-            self.add_log_entry(f"❌ Failed to clear demo devices: {str(e)}", "error")
+            self.add_log_entry(f"Demo Mode: Failed to clear devices - {str(e)}", "error")
 
     def _cycle_audio_assignment(self, device_id: str):
         """Cycle through available audio sources for a device"""
         audio_sources = self.audio_engine.get_audio_sources()
         if not audio_sources:
-            self.add_log_entry("❌ No audio sources available. Upload audio files first!", "error")
+            self.add_log_entry("Audio System: No sources available - upload files first", "error")
             return
         
         if len(audio_sources) == 1:
@@ -564,16 +679,16 @@ class UIManager:
         device_name = device.device_name if device else device_id
         
         # Provide rich feedback
-        self.add_log_entry(f"🎵 Assigned '{new_source.name}' to {device_name}", "success")
-        self.add_log_entry(f"📊 Audio {next_index + 1} of {len(audio_sources)} sources", "info")
+        self.add_log_entry(f"Audio Assignment: '{new_source.name}' to {device_name}", "success")
+        self.add_log_entry(f"Audio System: {next_index + 1} of {len(audio_sources)} sources", "info")
         
         # If this is audio file, show some details
         if hasattr(new_source, 'file_type') and new_source.file_type.name == 'AUDIO_FILE':
-            self.add_log_entry(f"📁 Playing custom audio file", "info")
+            self.add_log_entry(f"Audio System: Playing custom file", "info")
 
     def _handle_audio_upload(self):
         """Handle audio file upload with macOS native dialog"""
-        self.add_log_entry("🔄 Opening macOS native file picker...", "info")
+        self.add_log_entry("File Manager: Opening native file picker", "info")
         
         # Method 1: Direct AppleScript with enhanced file picker
         try:
@@ -609,22 +724,22 @@ class UIManager:
                 if file_path.startswith("ERROR:"):
                     error_msg = file_path.replace("ERROR: ", "")
                     if "User canceled" in error_msg or "cancelled" in error_msg:
-                        self.add_log_entry("📁 File selection cancelled by user", "info")
+                        self.add_log_entry("File Manager: Selection cancelled", "info")
                         return
                     else:
-                        self.add_log_entry(f"⚠️ File dialog error: {error_msg}", "warning")
+                        self.add_log_entry(f"File Manager: Dialog error - {error_msg}", "warning")
                         self._try_fallback_upload()
                         return
                         
                 elif file_path and file_path != "":
-                    self.add_log_entry(f"📁 Selected file: {file_path.split('/')[-1]}", "success")
+                    self.add_log_entry(f"File Manager: Selected - {file_path.split('/')[-1]}", "success")
                     self._process_uploaded_file(file_path)
                     return
                 else:
-                    self.add_log_entry("📁 No file selected", "info")
+                    self.add_log_entry("File Manager: No file selected", "info")
                     return
             else:
-                self.add_log_entry(f"⚠️ File dialog failed: {result.stderr}", "warning")
+                self.add_log_entry(f"File Manager: Dialog failed - {result.stderr}", "warning")
                 self._try_fallback_upload()
                 return
                 
@@ -632,13 +747,13 @@ class UIManager:
             self.add_log_entry("⏰ File selection timed out", "warning")
             return
         except Exception as e:
-            self.add_log_entry(f"⚠️ Native file dialog failed: {str(e)}", "error")
+            self.add_log_entry(f"File Manager: Native dialog failed - {str(e)}", "error")
             self._try_fallback_upload()
             return
 
     def _try_fallback_upload(self):
         """Fallback method using simpler file selection"""
-        self.add_log_entry("🔄 Trying alternative file selection...", "info")
+        self.add_log_entry("File Manager: Trying alternative selection", "info")
         
         try:
             import subprocess
@@ -662,11 +777,11 @@ class UIManager:
                     # Check if it's an audio file
                     audio_extensions = ['.wav', '.mp3', '.ogg', '.flac', '.m4a', '.aiff', '.mp4', '.wma']
                     if any(file_path.lower().endswith(ext) for ext in audio_extensions):
-                        self.add_log_entry(f"📁 Selected: {file_path.split('/')[-1]}", "success")
+                        self.add_log_entry(f"File Manager: Selected - {file_path.split('/')[-1]}", "success")
                         self._process_uploaded_file(file_path)
                         return
                     else:
-                        self.add_log_entry("⚠️ Please select a valid audio file", "warning")
+                        self.add_log_entry("File Manager: Please select valid audio file", "warning")
                         self.add_log_entry("Supported: WAV, MP3, OGG, FLAC, M4A, AIFF, MP4, WMA", "info")
                         return
             
@@ -675,7 +790,7 @@ class UIManager:
             self.add_log_entry("💡 Or drag audio file to terminal window", "info")
             
         except Exception as e:
-            self.add_log_entry(f"⚠️ All file selection methods failed: {str(e)}", "error")
+            self.add_log_entry(f"File Manager: All selection methods failed - {str(e)}", "error")
             self.add_log_entry("📝 Please manually enter file path in console", "info")
 
     def _process_uploaded_file(self, file_path: str):
@@ -684,7 +799,7 @@ class UIManager:
         import shutil
         
         if not os.path.exists(file_path):
-            self.add_log_entry(f"❌ File not found: {file_path}", "error")
+            self.add_log_entry(f"File Manager: File not found - {file_path}", "error")
             return
             
         # Extract filename and validate format
@@ -695,7 +810,7 @@ class UIManager:
         # Validate file format
         valid_extensions = ['.wav', '.mp3', '.ogg', '.flac', '.m4a', '.aiff', '.mp4', '.wma']
         if file_extension not in valid_extensions:
-            self.add_log_entry(f"❌ Unsupported format: {file_extension}", "error")
+            self.add_log_entry(f"File Manager: Unsupported format - {file_extension}", "error")
             self.add_log_entry(f"Supported formats: {', '.join(valid_extensions)}", "info")
             return
         
@@ -734,21 +849,21 @@ class UIManager:
                 # Reload all audio files to include the new one
                 self.audio_engine._reload_project_audio_files()
                 
-                self.add_log_entry(f"✅ Successfully saved: {filename}", "success")
+                self.add_log_entry(f"File Manager: Successfully saved - {filename}", "success")
                 self.add_log_entry(f"� Location: audio_files/{filename}", "info")
-                self.add_log_entry(f"🎵 Display name: {display_name}", "info")
+                self.add_log_entry(f"Audio System: Display name - {display_name}", "info")
                 
                 # Update UI to show new audio count
                 sources_count = len(self.audio_engine.get_audio_sources())
-                self.add_log_entry(f"📊 Total audio sources: {sources_count}", "success")
+                self.add_log_entry(f"Audio System: Total sources - {sources_count}", "success")
                 
             except Exception as e:
                 # If audio engine registration fails, still keep the file
-                self.add_log_entry(f"⚠️ File saved but audio engine error: {str(e)}", "warning")
-                self.add_log_entry(f"✅ File successfully saved to: {filename}", "success")
+                self.add_log_entry(f"Audio System: File saved but engine error - {str(e)}", "warning")
+                self.add_log_entry(f"File Manager: File saved to - {filename}", "success")
                 
         except Exception as e:
-            self.add_log_entry(f"❌ Failed to save audio file: {str(e)}", "error")
+            self.add_log_entry(f"File Manager: Failed to save file - {str(e)}", "error")
             self.add_log_entry(f"💡 Check permissions for audio_files directory", "warning")
 
     def _handle_audio_upload_console(self):
@@ -760,7 +875,7 @@ class UIManager:
         
         # This would normally prompt in console, but for GUI we'll show instruction
         print("\n" + "="*50)
-        print("🎵 AUDIO UPLOAD - Enter file path:")
+        print("AUDIO UPLOAD - Enter file path:")
         print("Supported: .wav, .mp3, .ogg, .flac, .m4a, .aiff")
         print("Example: /Users/username/Music/mysong.wav")
         print("="*50)
@@ -800,7 +915,7 @@ class UIManager:
             if source.id == audio_id:
                 if source.file_type == AudioFileType.AUDIO_FILE:
                     self.add_log_entry(f"Rename '{source.name}' - Enter new name in console:", "info")
-                    print(f"\n🏷️ RENAME AUDIO: '{source.name}'")
+                    print(f"\nRENAME AUDIO: '{source.name}'")
                     print("Enter new name in console:")
                     
                     try:
@@ -943,8 +1058,8 @@ class UIManager:
         self.distance_data[device_id].append((current_time, distance))
         self.volume_data[device_id].append((current_time, volume))
 
-        # Keep only data for the specified record length
-        cutoff = current_time - self.data_tracking['record_length']
+        # Keep only data for the specified record length (use distance mapping setting)
+        cutoff = current_time - self.distance_settings['data_history_duration']
         self.distance_data[device_id] = [d for d in self.distance_data[device_id] if d[0] > cutoff]
         self.volume_data[device_id] = [v for v in self.volume_data[device_id] if v[0] > cutoff]
 
@@ -992,10 +1107,10 @@ class UIManager:
         
         if self.current_page == NavigationPage.HOME:
             self._render_home_page()
-        elif self.current_page == NavigationPage.DEVICES:
-            self._render_devices_page()
-        elif self.current_page == NavigationPage.AUDIO:
-            self._render_audio_page()
+        elif self.current_page == NavigationPage.SIMULATION:
+            self._render_simulation_page()
+        elif self.current_page == NavigationPage.SETTINGS:
+            self._render_settings_page()
 
     def _render_navigation(self):
         nav_height = 60
@@ -1058,10 +1173,14 @@ class UIManager:
                                  self.screen.get_width() - Config.LAYOUT['padding'] * 2,
                                  content_height - Config.LAYOUT['padding'])
         
-        # HC-05 Connection Panel
+        # HC-05 Connection Panel for Sensor Nodes
         y_offset = 0
         y_offset += self._render_section(content_rect, y_offset, "🔵 HC-05 SensorNode Connection", 
                                        self._render_hc05_connection_content, 140)
+        
+        # Moving Object Device Connection Panel
+        y_offset += self._render_section(content_rect, y_offset, "🚗 Moving Object Device Connection", 
+                                       self._render_moving_object_connection_content, 100)
         
         # Two-column layout for the rest
         left_width = content_rect.width // 2 - 10
@@ -1083,8 +1202,10 @@ class UIManager:
         available_height = left_rect.height - 20  # Account for padding
         chart_height = available_height // 2 - 10  # 50% each with small gap
         
+        # Use max distance from distance mapping settings for chart scaling
+        max_chart_distance = self.distance_settings['max_distance']
         right_y += self._render_section(right_rect, right_y, "Real-Time Distance (cm)", 
-                                      lambda r: self._render_enhanced_chart(r, self.distance_data, 0, 200, "cm"), chart_height)
+                                      lambda r: self._render_enhanced_chart(r, self.distance_data, 0, max_chart_distance, "cm"), chart_height)
         right_y += 20  # Small gap between charts
         right_y += self._render_section(right_rect, right_y, "Audio Volume (%)", 
                                       lambda r: self._render_enhanced_chart(r, self.volume_data, 0, 100, "%"), chart_height)
@@ -1139,7 +1260,7 @@ class UIManager:
         
         # Left column - Audio Library  
         left_y = 0
-        left_y += self._render_elegant_section(left_rect, left_y, "🎵 Audio Library", 
+        left_y += self._render_elegant_section(left_rect, left_y, "Audio Library", 
                                              self._render_audio_library_content, main_height)
         
         # Right column - Controls and Settings
@@ -1159,7 +1280,7 @@ class UIManager:
         # Upload section header
         header_y = rect.y + 12
         self.fonts['h2'].render_to(self.screen, (rect.x + 20, header_y), 
-                                 "📁 Upload New Audio", Config.COLORS['text_primary'])
+                                 "Upload New Audio", Config.COLORS['text_primary'])
         
         # Upload button with modern styling
         button_width = 200
@@ -1187,7 +1308,7 @@ class UIManager:
         
         # Button text with icon
         self.fonts['body'].render_to(self.screen, (upload_btn_rect.x + 15, upload_btn_rect.y + 8), 
-                                   "📁 Upload Audio File", text_color)
+                                   "Upload Audio File", text_color)
         
         # Store button rect for click detection
         if not hasattr(self, 'upload_button_rects'):
@@ -1252,16 +1373,16 @@ class UIManager:
         if self.hc05_status['available']:
             self._render_button(scan_rect, 'scan_hc05', "🔍 Scan HC-05", Config.COLORS['primary'])
         else:
-            self._render_button(scan_rect, 'scan_hc05', "❌ BT Disabled", Config.COLORS['surface_light'])
+            self._render_button(scan_rect, 'scan_hc05', "BT Disabled", Config.COLORS['surface_light'])
         
         # Demo toggle
-        demo_text = "🔴 Stop Demo" if self.device_manager.demo_mode else "🎭 Start Demo"
+        demo_text = "Stop Demo" if self.device_manager.demo_mode else "Start Demo"
         demo_color = Config.COLORS['error'] if self.device_manager.demo_mode else Config.COLORS['success']
         demo_rect = pygame.Rect(scan_rect.right + spacing, row1_y, button_width, button_height)
         self._render_button(demo_rect, 'demo_toggle', demo_text, demo_color)
         
         # Global audio enable/disable button
-        audio_text = "🔇 Audio OFF" if not self.global_audio_enabled else "🔊 Audio ON"
+        audio_text = "Audio OFF" if not self.global_audio_enabled else "Audio ON"
         audio_color = Config.COLORS['error'] if not self.global_audio_enabled else Config.COLORS['success']
         audio_rect = pygame.Rect(demo_rect.right + spacing, row1_y, button_width, button_height)
         self._render_button(audio_rect, 'global_audio_toggle', audio_text, audio_color)
@@ -1285,33 +1406,45 @@ class UIManager:
             # Clear all demo devices button
             clear_demo_rect = pygame.Rect(remove_demo_rect.right + spacing, row2_y, button_width, button_height)
             if demo_device_count > 1:
-                self._render_button(clear_demo_rect, 'clear_demo_devices', "🗑️ Clear All", Config.COLORS['warning'])
+                self._render_button(clear_demo_rect, 'clear_demo_devices', "Clear All", Config.COLORS['warning'])
             else:
-                self._render_button(clear_demo_rect, 'clear_demo_devices', "🗑️ Clear All", Config.COLORS['surface_light'])
+                self._render_button(clear_demo_rect, 'clear_demo_devices', "Clear All", Config.COLORS['surface_light'])
+    
+    def _render_moving_object_connection_content(self, rect: pygame.Rect):
+        """Render moving object device connection controls"""
+        button_height = 35
+        button_width = 140
+        spacing = 12
         
-        # Status text
-        status_y = rect.y + button_height + (50 if self.device_manager.demo_mode else 20)
-        connected_devices = len(self.device_manager.get_connected_devices())
+        # First row - Connection controls
+        row1_y = rect.y
         
-        if connected_devices > 0:
-            demo_count = len([d for d in self.device_manager.devices.values() if 'Demo' in d.device_name])
-            real_count = connected_devices - demo_count
-            
-            if demo_count > 0 and real_count > 0:
-                status_text = f"✅ {real_count} HC-05 + {demo_count} demo devices connected"
-            elif demo_count > 0:
-                status_text = f"🎭 {demo_count} demo device(s) active"
-            else:
-                status_text = f"✅ {real_count} HC-05 device(s) connected"
+        # HC-05 scan for moving object button
+        scan_moving_rect = pygame.Rect(rect.x, row1_y, button_width, button_height)
+        if self.hc05_status['available']:
+            self._render_button(scan_moving_rect, 'scan_moving_object', "🔍 Scan Moving", Config.COLORS['primary'])
+        else:
+            self._render_button(scan_moving_rect, 'scan_moving_object', "BT Disabled", Config.COLORS['surface_light'])
+        
+        # Demo moving object toggle
+        demo_moving_text = "Stop Demo Car" if self.demo_moving_object_enabled else "Start Demo Car"
+        demo_moving_color = Config.COLORS['error'] if self.demo_moving_object_enabled else Config.COLORS['success']
+        demo_moving_rect = pygame.Rect(scan_moving_rect.right + spacing, row1_y, button_width, button_height)
+        self._render_button(demo_moving_rect, 'demo_moving_toggle', demo_moving_text, demo_moving_color)
+        
+        # Connection status indicator
+        status_rect = pygame.Rect(demo_moving_rect.right + spacing, row1_y, button_width, button_height)
+        if self.moving_object_device:
+            status_text = f"Connected: {self.moving_object_device.device_name[:12]}"
             status_color = Config.COLORS['success']
-        elif self.device_manager.demo_mode:
-            status_text = "🎭 Demo mode ready - click 'Add Device' to create virtual devices"
+        elif self.demo_moving_object_enabled:
+            status_text = "Demo Active"
             status_color = Config.COLORS['warning']
         else:
-            status_text = "⏳ No devices connected - scan for HC-05 or enable demo mode"
-            status_color = Config.COLORS['text_muted']
+            status_text = "Disconnected"
+            status_color = Config.COLORS['error']
         
-        self.fonts['body'].render_to(self.screen, (rect.x, status_y), status_text, status_color)
+        self._render_button(status_rect, 'moving_object_status', status_text, status_color)
 
     def _render_device_management_content(self, rect: pygame.Rect):
         # Show available audio sources
@@ -1424,10 +1557,21 @@ class UIManager:
             
             # Enhanced status display with pill-shaped badge
             status_text = f"{device.status.value.title()}"
-            if device.status == DeviceStatus.CONNECTED and device.last_distance > 0:
-                status_text += f" • {device.last_distance:.1f}cm"
-            elif device.status == DeviceStatus.CONNECTED:
-                status_text += " • Waiting..."
+            if device.status == DeviceStatus.CONNECTED:
+                if device.device_type == "moving_object":
+                    # Moving objects send orientation data, not distance
+                    if hasattr(device, 'last_orientation') and device.last_orientation is not None:
+                        status_text += f" • {device.last_orientation:.0f}°"
+                    else:
+                        status_text += " • Ready"
+                elif device.last_distance > 0:
+                    status_text += f" • {device.last_distance:.1f}cm"
+                else:
+                    status_text += " • Waiting..."
+            
+            # Debug: Add device type information for moving objects
+            if device.device_type == "moving_object":
+                print(f"🔍 DEBUG - Moving object UI: {device.device_name} status={device.status.value} type={device.device_type}")
             
             # Status badge with rounded background
             status_text_surface, _ = self.fonts['small'].render(status_text, Config.COLORS['text_primary'])
@@ -1471,7 +1615,7 @@ class UIManager:
                 actual_audio_playing = device_enabled and self.global_audio_enabled
                 
                 if actual_audio_playing:
-                    toggle_label = "🔊 Audio Playing"
+                    toggle_label = "Audio Playing"
                     label_color = Config.COLORS['success']
                 elif device_enabled and not self.global_audio_enabled:
                     toggle_label = "🔇 Global Muted"
@@ -1573,26 +1717,7 @@ class UIManager:
                 self.fonts['small'].render_to(self.screen, (card_rect.x + 15, y_pos + 50),
                                             f"⚠️ {error_msg}", Config.COLORS['error'])
             
-            # Volume level indicator bar for connected devices
-            if device.status == DeviceStatus.CONNECTED and device.last_distance > 0:
-                # Calculate current volume level
-                volume_level = self._calculate_volume_from_distance(device.last_distance)
-                volume_ratio = volume_level / 100.0  # Convert to 0-1 range
-                
-                # Volume bar background
-                bar_bg_rect = pygame.Rect(card_rect.right - 80, y_pos + 75, 60, 8)
-                pygame.draw.rect(self.screen, Config.COLORS['surface'], bar_bg_rect, border_radius=4)
-                pygame.draw.rect(self.screen, Config.COLORS['border'], bar_bg_rect, width=1, border_radius=4)
-                
-                # Volume bar fill - use device color instead of green
-                if volume_ratio > 0:
-                    bar_fill_width = int(volume_ratio * (bar_bg_rect.width - 2))
-                    bar_fill_rect = pygame.Rect(bar_bg_rect.x + 2, bar_bg_rect.y + 1, bar_fill_width, bar_bg_rect.height - 2)
-                    pygame.draw.rect(self.screen, device_color, bar_fill_rect, border_radius=3)
-                
-                # Volume percentage text
-                self.fonts['tiny'].render_to(self.screen, (bar_bg_rect.x, bar_bg_rect.y - 12),
-                                           f"{volume_level:.0f}%", Config.COLORS['text_muted'])
+            # Removed volume level indicator bar as requested
             
             y_pos += device_card_height
         
@@ -2205,7 +2330,8 @@ class UIManager:
             
             for timestamp, value in data_points:
                 # Calculate position within chart area
-                time_ratio = max(0, min(1, (current_time - timestamp) / 60.0))  # Last 60 seconds
+                time_range = self.distance_settings['data_history_duration']  # Use configurable time range
+                time_ratio = max(0, min(1, (current_time - timestamp) / time_range))
                 value_ratio = (value - min_val) / (max_val - min_val) if max_val > min_val else 0
                 value_ratio = max(0, min(1, value_ratio))
                 
@@ -2249,10 +2375,11 @@ class UIManager:
         
         # X-axis grid lines and labels (time)
         num_x_ticks = 6
+        time_range = self.distance_settings['data_history_duration']  # Use configurable time range
         for i in range(num_x_ticks + 1):
             ratio = i / num_x_ticks
             x = chart_rect.right - (ratio * chart_rect.width)
-            seconds_ago = ratio * 60  # 60 seconds total
+            seconds_ago = ratio * time_range  # Use configurable time range
             
             # Grid line
             if i > 0 and i < num_x_ticks:  # Don't draw on borders
@@ -2376,7 +2503,7 @@ class UIManager:
         """Update UI state"""
         # Clean up old data (keep last 60 seconds for real-time view)
         current_time = time.time()
-        cutoff_time = current_time - 60.0  # Keep 60 seconds of data for real-time charts
+        cutoff_time = current_time - self.distance_settings['data_history_duration']  # Use configurable data history duration
         
         # Clean up distance data
         for device_id in list(self.distance_data.keys()):
@@ -2401,6 +2528,14 @@ class UIManager:
             self.volume_data[device_id] = [
                 (t, v) for t, v in self.volume_data[device_id] if t > cutoff_time
             ]
+        
+        # Check for moving object orientation updates and pass to simulation page
+        if self.simulation_page:
+            moving_object_updates = self.device_manager.get_moving_object_updates()
+            for device_id, orientation in moving_object_updates:
+                self.simulation_page.update_real_moving_object_orientation(orientation)
+                # Also log the update for visibility
+                self.add_log_entry(f"Moving object orientation updated: {orientation:.1f}°", "success")
 
     def _show_audio_assignment_menu(self, device_id: str, pos: Tuple[int, int]):
         """Show audio assignment menu for a device"""
@@ -2434,8 +2569,8 @@ class UIManager:
         self.device_audio_assignments[device_id] = new_source.id
         
         # Show detailed assignment info
-        self.add_log_entry(f"🎵 Assigned '{new_source.name}' to {device_name}", "success")
-        self.add_log_entry(f"📊 Audio source {next_index + 1} of {len(audio_sources)}", "info")
+        self.add_log_entry(f"Audio Assignment: '{new_source.name}' to {device_name}", "success")
+        self.add_log_entry(f"Audio System: source {next_index + 1} of {len(audio_sources)}", "info")
         
         # Show what's next
         if len(audio_sources) > 2:
@@ -2465,6 +2600,645 @@ class UIManager:
         # Apply the effect change to the audio engine
         if hasattr(self.audio_engine, 'set_effect_enabled'):
             self.audio_engine.set_effect_enabled(effect_id, new_state)
+
+    def _render_simulation_page(self):
+        """Render the simulation page with trilateration visualization"""
+        # Calculate content area (same as other pages)
+        content_y = 120  # Below header
+        content_height = self.screen.get_height() - content_y
+        content_rect = pygame.Rect(Config.LAYOUT['padding'], content_y, 
+                                 self.screen.get_width() - Config.LAYOUT['padding'] * 2,
+                                 content_height - Config.LAYOUT['padding'])
+        
+        # Initialize simulation page if not already done
+        if not self.simulation_page:
+            self.simulation_page = SimulationPage(self.screen, self.device_manager, self.audio_engine, self.fonts)
+        
+        # Render the simulation page with the content rectangle
+        self.simulation_page.render(content_rect)
+        
+        # Handle simulation page interactions
+        for key, rect in self.simulation_page.button_rects.items():
+            self.button_rects[f"sim_{key}"] = rect
+
+    def _render_settings_page(self):
+        """Render the settings page (formerly audio page) with enhanced features"""
+        content_y = 120
+        content_height = self.screen.get_height() - content_y
+        
+        content_rect = pygame.Rect(Config.LAYOUT['padding'], content_y, 
+                                 self.screen.get_width() - Config.LAYOUT['padding'] * 2,
+                                 content_height - Config.LAYOUT['padding'])
+        
+        # Enhanced three-section layout for better organization
+        # Top section: Upload controls (full width)
+        upload_height = 80
+        upload_rect = pygame.Rect(content_rect.x, content_rect.y, content_rect.width, upload_height)
+        self._render_audio_upload_section(upload_rect)
+        
+        # Main content area below upload section
+        main_y = content_rect.y + upload_height + 20
+        main_height = content_rect.height - upload_height - 20
+        
+        # Two-column layout for main content (50/50 split as requested)
+        left_width = int((content_rect.width - 20) * 0.5)  # Audio library takes 50%
+        right_width = content_rect.width - left_width - 20  # Distance settings take 50%
+        
+        # Left column: Audio library with enhanced file management
+        library_rect = pygame.Rect(content_rect.x, main_y, left_width, main_height)
+        self._render_enhanced_audio_library(library_rect)
+        
+        # Right column: Enhanced distance mapping display
+        settings_rect = pygame.Rect(content_rect.x + left_width + 20, main_y, right_width, main_height)
+        self._render_enhanced_distance_mapping_section(settings_rect)
+
+    def _render_enhanced_audio_library(self, rect: pygame.Rect):
+        """Render enhanced audio library with file management features"""
+        # Draw section background
+        pygame.draw.rect(self.screen, Config.COLORS['surface'], rect, border_radius=8)
+        pygame.draw.rect(self.screen, Config.COLORS['border'], rect, width=2, border_radius=8)
+        
+        # Section header
+        header_rect = pygame.Rect(rect.x + 15, rect.y + 15, rect.width - 30, 30)
+        self.fonts['body'].render_to(self.screen, header_rect.topleft, "Audio Library", Config.COLORS['text_primary'])
+        
+        # Get audio sources
+        audio_sources = self.audio_engine.get_audio_sources()
+        if not audio_sources:
+            no_audio_rect = pygame.Rect(rect.x + 15, rect.y + 60, rect.width - 30, 50)
+            self.fonts['small'].render_to(self.screen, no_audio_rect.topleft, 
+                                        "No audio files loaded. Upload files using the controls above.", 
+                                        Config.COLORS['text_muted'])
+            return
+        
+        # Audio list with scrolling
+        list_y = rect.y + 60
+        list_height = rect.height - 75
+        item_height = 80
+        visible_items = list_height // item_height
+        
+        scroll_offset = self.scroll_offsets.get('audio_library', 0)
+        start_index = max(0, scroll_offset)
+        end_index = min(len(audio_sources), start_index + visible_items)
+        
+        for i, audio_source in enumerate(audio_sources[start_index:end_index], start_index):
+            item_y = list_y + (i - start_index) * item_height
+            item_rect = pygame.Rect(rect.x + 15, item_y, rect.width - 30, item_height - 5)
+            
+            # Item background
+            item_color = Config.COLORS['surface_light'] if i % 2 == 0 else Config.COLORS['surface']
+            pygame.draw.rect(self.screen, item_color, item_rect, border_radius=6)
+            
+            # Audio file info
+            name_rect = pygame.Rect(item_rect.x + 10, item_rect.y + 8, item_rect.width - 120, 20)
+            self.fonts['body'].render_to(self.screen, name_rect.topleft, audio_source.name[:35] + ("..." if len(audio_source.name) > 35 else ""), Config.COLORS['text_primary'])
+            
+            # File details (size and duration)
+            try:
+                import os
+                file_path = getattr(audio_source, 'file_path', '')
+                if file_path and os.path.exists(file_path):
+                    file_size = os.path.getsize(file_path) / 1024  # KB
+                    size_text = f"{file_size:.1f} KB"
+                    
+                    # Get audio duration
+                    duration_ms = self._get_audio_duration_ms(file_path)
+                    duration_text = f"{duration_ms} ms" if duration_ms > 0 else "Unknown duration"
+                else:
+                    size_text = "Unknown size"
+                    duration_text = "Unknown duration"
+            except:
+                size_text = "Unknown size"
+                duration_text = "Unknown duration"
+            
+            # Details without format (as requested)
+            details_text = f"{size_text} • {duration_text}"
+            
+            # Details with better styling
+            details_rect = pygame.Rect(item_rect.x + 10, item_rect.y + 32, item_rect.width - 120, 16)
+            self.fonts['small'].render_to(self.screen, details_rect.topleft, details_text, Config.COLORS['text_muted'])
+            
+            # Add waveform icon for better visual appeal
+            waveform_rect = pygame.Rect(item_rect.x + 10, item_rect.y + 50, item_rect.width - 120, 12)
+            self._render_mini_waveform(waveform_rect, audio_source)
+            
+            # Action buttons
+            edit_btn_rect = pygame.Rect(item_rect.right - 100, item_rect.y + 8, 40, 25)
+            delete_btn_rect = pygame.Rect(item_rect.right - 55, item_rect.y + 8, 45, 25)
+            
+            # Edit button
+            pygame.draw.rect(self.screen, Config.COLORS['accent'], edit_btn_rect, border_radius=4)
+            self.fonts['small'].render_to(self.screen, (edit_btn_rect.x + 8, edit_btn_rect.y + 6), "Edit", Config.COLORS['text_primary'])
+            self.button_rects[f'edit_audio_{audio_source.id}'] = edit_btn_rect
+            
+            # Delete button
+            pygame.draw.rect(self.screen, Config.COLORS['error'], delete_btn_rect, border_radius=4)
+            self.fonts['small'].render_to(self.screen, (delete_btn_rect.x + 8, delete_btn_rect.y + 6), "Delete", Config.COLORS['text_primary'])
+            self.button_rects[f'delete_audio_{audio_source.id}'] = delete_btn_rect
+
+    def _render_distance_mapping_section(self, rect: pygame.Rect):
+        """Render distance mapping section with edit button"""
+        # Draw section background
+        pygame.draw.rect(self.screen, Config.COLORS['surface'], rect, border_radius=8)
+        pygame.draw.rect(self.screen, Config.COLORS['border'], rect, width=2, border_radius=8)
+        
+        # Section header with edit button
+        header_rect = pygame.Rect(rect.x + 15, rect.y + 15, rect.width - 100, 30)
+        self.fonts['body'].render_to(self.screen, header_rect.topleft, "Distance Mapping", Config.COLORS['text_primary'])
+        
+        # Edit button
+        edit_btn_rect = pygame.Rect(rect.right - 80, rect.y + 15, 60, 30)
+        pygame.draw.rect(self.screen, Config.COLORS['accent'], edit_btn_rect, border_radius=6)
+        self.fonts['small'].render_to(self.screen, (edit_btn_rect.x + 15, edit_btn_rect.y + 8), "Edit", Config.COLORS['text_primary'])
+        self.button_rects['open_distance_editor'] = edit_btn_rect
+        
+        # Current settings display
+        settings_y = rect.y + 60
+        line_height = 25
+        
+        settings_info = [
+            f"Low Distance: {self.distance_settings['min_distance']:.1f}m → Max Volume: {self.distance_settings['max_volume']:.0f}%",
+            f"High Distance: {self.distance_settings['max_distance']:.1f}m → Min Volume: {self.distance_settings['min_volume']:.0f}%",
+            f"Algorithm: {self.distance_settings['decay_type'].title()}",
+            f"Max Graph Distance: {self.distance_settings['max_graph_distance']:.1f}m"
+        ]
+        
+        for i, info in enumerate(settings_info):
+            info_rect = pygame.Rect(rect.x + 15, settings_y + i * line_height, rect.width - 30, line_height)
+            self.fonts['small'].render_to(self.screen, info_rect.topleft, info, Config.COLORS['text_muted'])
+        
+        # Distance curve preview (simple visualization)
+        preview_rect = pygame.Rect(rect.x + 15, settings_y + len(settings_info) * line_height + 20, rect.width - 30, 100)
+        pygame.draw.rect(self.screen, Config.COLORS['surface_light'], preview_rect, border_radius=4)
+        pygame.draw.rect(self.screen, Config.COLORS['border'], preview_rect, width=1, border_radius=4)
+        
+        # Draw simple curve
+        min_dist = self.distance_settings['min_distance']
+        max_dist = self.distance_settings['max_distance']
+        min_vol = self.distance_settings['min_volume']
+        max_vol = self.distance_settings['max_volume']
+        
+        points = []
+        for x in range(preview_rect.width):
+            # Normalize x to distance range
+            distance = min_dist + (x / preview_rect.width) * (max_dist - min_dist)
+            
+            # Calculate volume based on decay type
+            if self.distance_settings['decay_type'] == 'linear':
+                volume = max_vol - ((distance - min_dist) / (max_dist - min_dist)) * (max_vol - min_vol)
+            elif self.distance_settings['decay_type'] == 'exponential':
+                import math
+                factor = math.exp(-3 * (distance - min_dist) / (max_dist - min_dist))
+                volume = min_vol + (max_vol - min_vol) * factor
+            else:  # Default to linear
+                volume = max_vol - ((distance - min_dist) / (max_dist - min_dist)) * (max_vol - min_vol)
+            
+            # Convert volume to y coordinate
+            y_ratio = (volume - min_vol) / (max_vol - min_vol) if max_vol > min_vol else 0
+            y = preview_rect.bottom - 10 - y_ratio * (preview_rect.height - 20)
+            points.append((preview_rect.x + x, y))
+        
+        if len(points) > 1:
+            pygame.draw.lines(self.screen, Config.COLORS['accent'], False, points, 2)
+
+    def _handle_simulation_click(self, pos: Tuple[int, int]):
+        """Handle clicks on simulation page"""
+        if not self.simulation_page:
+            return
+        
+        # Delegate to simulation page
+        self.simulation_page.handle_click(pos)
+
+    def _handle_settings_click(self, pos: Tuple[int, int]):
+        """Handle clicks on settings page (formerly audio page)"""
+        # Distance mapping editor button
+        if 'open_distance_editor' in self.button_rects and self.button_rects['open_distance_editor'].collidepoint(pos):
+            self._open_distance_mapping_editor()
+            return
+        
+        # Demo pattern buttons
+        for button_id, button_rect in self.button_rects.items():
+            if button_rect.collidepoint(pos):
+                if button_id.startswith('demo_pattern_'):
+                    pattern = button_id[13:]  # Remove 'demo_pattern_' prefix
+                    self.device_manager.update_demo_settings(pattern=pattern)
+                    self.demo_settings['pattern'] = pattern
+                    self.add_log_entry(f"Demo Settings: Pattern changed to {pattern}", "success")
+                elif button_id == 'demo_speed_dec':
+                    new_speed = max(0.1, self.device_manager.demo_speed - 0.1)
+                    self.device_manager.update_demo_settings(speed=new_speed)
+                    period = 20.0 / new_speed
+                    self.add_log_entry(f"Demo Settings: Speed {new_speed:.1f}x (Period: {period:.1f}s)", "success")
+                elif button_id == 'demo_speed_inc':
+                    new_speed = min(5.0, self.device_manager.demo_speed + 0.1)
+                    self.device_manager.update_demo_settings(speed=new_speed)
+                    period = 20.0 / new_speed
+                    self.add_log_entry(f"Demo Settings: Speed {new_speed:.1f}x (Period: {period:.1f}s)", "success")
+                elif button_id == 'demo_amplitude_dec':
+                    new_amplitude = max(50.0, self.device_manager.demo_amplitude - 10.0)
+                    self.device_manager.update_demo_settings(amplitude=new_amplitude)
+                    self.add_log_entry(f"Demo Settings: Range {new_amplitude:.0f}cm", "success")
+                elif button_id == 'demo_amplitude_inc':
+                    new_amplitude = min(300.0, self.device_manager.demo_amplitude + 10.0)
+                    self.device_manager.update_demo_settings(amplitude=new_amplitude)
+                    self.add_log_entry(f"Demo Settings: Range {new_amplitude:.0f}cm", "success")
+                elif button_id.startswith('edit_audio_'):
+                    audio_id = button_id[11:]  # Remove 'edit_audio_' prefix
+                    self._edit_audio_file(audio_id)
+                elif button_id.startswith('delete_audio_'):
+                    audio_id = button_id[13:]  # Remove 'delete_audio_' prefix
+                    self._delete_audio_file(audio_id)
+        
+        # Handle other clicks (existing audio page functionality)
+        self._handle_audio_click(pos)
+
+    def _open_distance_mapping_editor(self):
+        """Open the distance mapping editor window"""
+        if not self.distance_mapping_editor:
+            self.distance_mapping_editor = DistanceMappingEditor(self.screen, self.distance_settings)
+        
+        # Run the editor
+        result = self.distance_mapping_editor.run()
+        if result:
+            # Update settings with new values
+            self.distance_settings.update(result)
+            self.add_log_entry("Connected: Distance mapping settings updated", "success")
+        
+        # Clean up
+        self.distance_mapping_editor = None
+
+    def _edit_audio_file(self, audio_id: str):
+        """Edit audio file name"""
+        audio_sources = self.audio_engine.get_audio_sources()
+        audio_source = next((s for s in audio_sources if s.id == audio_id), None)
+        
+        if audio_source:
+            # For now, just log - in a full implementation, you'd show a text input dialog
+            self.add_log_entry(f"File Manager: Edit audio file: {audio_source.name}", "info")
+            self.add_log_entry("File Manager: Audio file editing coming soon!", "info")
+
+    def _delete_audio_file(self, audio_id: str):
+        """Delete audio file"""
+        if hasattr(self.audio_engine, 'remove_audio_source'):
+            success = self.audio_engine.remove_audio_source(audio_id)
+            if success:
+                self.add_log_entry(f"File Manager: Audio file deleted successfully", "success")
+                # Remove from device assignments
+                for device_id in list(self.device_audio_assignments.keys()):
+                    if self.device_audio_assignments[device_id] == audio_id:
+                        del self.device_audio_assignments[device_id]
+            else:
+                self.add_log_entry(f"File Manager: Failed to delete audio file", "error")
+        else:
+            self.add_log_entry(f"File Manager: Delete functionality not available", "error")
+
+    def _render_enhanced_distance_mapping_section(self, rect: pygame.Rect):
+        """Render enhanced distance mapping section with preview functionality"""
+        # Draw section background
+        pygame.draw.rect(self.screen, Config.COLORS['surface'], rect, border_radius=8)
+        pygame.draw.rect(self.screen, Config.COLORS['border'], rect, width=2, border_radius=8)
+        
+        # Section header with edit button
+        header_rect = pygame.Rect(rect.x + 15, rect.y + 15, rect.width - 100, 30)
+        self.fonts['h3'].render_to(self.screen, header_rect.topleft, "Distance Mapping Configuration", Config.COLORS['text_primary'])
+        
+        # Edit button
+        edit_btn_rect = pygame.Rect(rect.right - 80, rect.y + 15, 60, 30)
+        pygame.draw.rect(self.screen, Config.COLORS['accent'], edit_btn_rect, border_radius=6)
+        self.fonts['small'].render_to(self.screen, (edit_btn_rect.x + 15, edit_btn_rect.y + 8), "Edit", Config.COLORS['text_primary'])
+        self.button_rects['open_distance_editor'] = edit_btn_rect
+        
+        # Current settings display
+        settings_y = rect.y + 60
+        line_height = 25
+        
+        settings_info = [
+            f"Algorithm: {self.distance_settings['decay_type'].replace('_', ' ').title()}",
+            f"Range: {self.distance_settings['min_distance']:.1f}m - {self.distance_settings['max_distance']:.1f}m",
+            f"Volume: {self.distance_settings['min_volume']:.0f}% - {self.distance_settings['max_volume']:.0f}%",
+            f"Steepness: {self.distance_settings.get('steepness', 1.0):.1f}",
+            f"Chart History: {self.distance_settings['data_history_duration']:.0f}s"
+        ]
+        
+        for i, info in enumerate(settings_info):
+            info_rect = pygame.Rect(rect.x + 15, settings_y + i * line_height, rect.width - 30, line_height)
+            self.fonts['body'].render_to(self.screen, info_rect.topleft, info, Config.COLORS['text_secondary'])
+        
+        # Distance mapping preview graph (expanded size, positioned after settings)
+        preview_section_y = settings_y + len(settings_info) * line_height + 30
+        preview_height = 180  # Larger graph for better visibility
+        
+        preview_rect = pygame.Rect(rect.x + 15, preview_section_y, 
+                                 rect.width - 30, preview_height)
+        self._render_distance_mapping_preview(preview_rect)
+        
+        # Demo device settings section (moved below the graph)
+        demo_section_y = preview_section_y + preview_height + 20
+        demo_section_height = 80  # Reduced since we have more space now
+        
+        # Demo section header
+        self.fonts['body'].render_to(self.screen, (rect.x + 15, demo_section_y), 
+                                   "Demo Device Pattern", Config.COLORS['text_primary'])
+        
+        # Demo pattern buttons
+        pattern_y = demo_section_y + 25
+        pattern_buttons = ['linear', 'sinusoidal', 'random']
+        button_width = 70
+        for i, pattern in enumerate(pattern_buttons):
+            btn_x = rect.x + 15 + i * (button_width + 10)
+            btn_rect = pygame.Rect(btn_x, pattern_y, button_width, 25)
+            
+            # Check if this is the current pattern
+            current_pattern = self.device_manager.demo_pattern
+            is_selected = (pattern == current_pattern)
+            
+            # Draw button
+            color = Config.COLORS['primary'] if is_selected else Config.COLORS['surface_light']
+            pygame.draw.rect(self.screen, color, btn_rect, border_radius=4)
+            pygame.draw.rect(self.screen, Config.COLORS['border'], btn_rect, width=1, border_radius=4)
+            
+            # Button text
+            text_color = Config.COLORS['text_primary'] if is_selected else Config.COLORS['text_secondary']
+            self.fonts['small'].render_to(self.screen, (btn_x + 8, pattern_y + 6), 
+                                        pattern.title(), text_color)
+            
+            # Store button for click handling
+            self.button_rects[f'demo_pattern_{pattern}'] = btn_rect
+        
+        # Demo speed and amplitude controls
+        controls_y = pattern_y + 35
+        
+        # Speed control buttons
+        speed_label_rect = pygame.Rect(rect.x + 15, controls_y, 60, 20)
+        self.fonts['caption'].render_to(self.screen, speed_label_rect.topleft, 
+                                      f"Speed: {self.device_manager.demo_speed:.1f}x", Config.COLORS['text_muted'])
+        
+        # Speed decrease button
+        speed_dec_rect = pygame.Rect(rect.x + 80, controls_y - 2, 25, 20)
+        pygame.draw.rect(self.screen, Config.COLORS['surface_light'], speed_dec_rect, border_radius=3)
+        pygame.draw.rect(self.screen, Config.COLORS['border'], speed_dec_rect, width=1, border_radius=3)
+        self.fonts['small'].render_to(self.screen, (speed_dec_rect.x + 8, speed_dec_rect.y + 4), 
+                                    "-", Config.COLORS['text_secondary'])
+        self.button_rects['demo_speed_dec'] = speed_dec_rect
+        
+        # Speed increase button
+        speed_inc_rect = pygame.Rect(rect.x + 110, controls_y - 2, 25, 20)
+        pygame.draw.rect(self.screen, Config.COLORS['surface_light'], speed_inc_rect, border_radius=3)
+        pygame.draw.rect(self.screen, Config.COLORS['border'], speed_inc_rect, width=1, border_radius=3)
+        self.fonts['small'].render_to(self.screen, (speed_inc_rect.x + 8, speed_inc_rect.y + 4), 
+                                    "+", Config.COLORS['text_secondary'])
+        self.button_rects['demo_speed_inc'] = speed_inc_rect
+        
+        # Period display (calculated from speed)
+        period_seconds = 20.0 / self.device_manager.demo_speed  # Base period is 20 seconds
+        period_text = f"Period: {period_seconds:.1f}s"
+        self.fonts['caption'].render_to(self.screen, (rect.x + 150, controls_y), 
+                                      period_text, Config.COLORS['text_muted'])
+        
+        # Amplitude control (second row)
+        amp_controls_y = controls_y + 25
+        amp_label_rect = pygame.Rect(rect.x + 15, amp_controls_y, 60, 20)
+        self.fonts['caption'].render_to(self.screen, amp_label_rect.topleft, 
+                                      f"Range: {self.device_manager.demo_amplitude:.0f}cm", Config.COLORS['text_muted'])
+        
+        # Amplitude decrease button
+        amp_dec_rect = pygame.Rect(rect.x + 80, amp_controls_y - 2, 25, 20)
+        pygame.draw.rect(self.screen, Config.COLORS['surface_light'], amp_dec_rect, border_radius=3)
+        pygame.draw.rect(self.screen, Config.COLORS['border'], amp_dec_rect, width=1, border_radius=3)
+        self.fonts['small'].render_to(self.screen, (amp_dec_rect.x + 8, amp_dec_rect.y + 4), 
+                                    "-", Config.COLORS['text_secondary'])
+        self.button_rects['demo_amplitude_dec'] = amp_dec_rect
+        
+        # Amplitude increase button
+        amp_inc_rect = pygame.Rect(rect.x + 110, amp_controls_y - 2, 25, 20)
+        pygame.draw.rect(self.screen, Config.COLORS['surface_light'], amp_inc_rect, border_radius=3)
+        pygame.draw.rect(self.screen, Config.COLORS['border'], amp_inc_rect, width=1, border_radius=3)
+        self.fonts['small'].render_to(self.screen, (amp_inc_rect.x + 8, amp_inc_rect.y + 4), 
+                                    "+", Config.COLORS['text_secondary'])
+        self.button_rects['demo_amplitude_inc'] = amp_inc_rect
+
+    def _render_distance_mapping_preview(self, rect: pygame.Rect):
+        """Render beautiful enhanced preview graph of current distance mapping"""
+        if rect.height < 100:  # Minimum height requirement
+            return
+            
+        # Draw preview background with gradient effect
+        pygame.draw.rect(self.screen, Config.COLORS['surface_light'], rect, border_radius=8)
+        pygame.draw.rect(self.screen, Config.COLORS['border'], rect, width=2, border_radius=8)
+        
+        # Graph area with padding for labels and axes
+        graph_rect = pygame.Rect(rect.x + 45, rect.y + 35, rect.width - 65, rect.height - 55)
+        
+        # Enhanced title
+        title_rect = pygame.Rect(rect.x + 15, rect.y + 8, rect.width - 30, 20)
+        self.fonts['body'].render_to(self.screen, title_rect.topleft, 
+                                   "Distance → Volume Mapping", Config.COLORS['text_primary'])
+        
+        # Draw grid lines for better readability
+        grid_color = (*Config.COLORS['border_light'][:3], 50)  # Semi-transparent
+        
+        # Vertical grid lines (distance markers)
+        num_v_lines = 5
+        for i in range(num_v_lines + 1):
+            x = graph_rect.x + (i / num_v_lines) * graph_rect.width
+            if i > 0 and i < num_v_lines:  # Skip first and last
+                pygame.draw.line(self.screen, Config.COLORS['border_light'], 
+                               (x, graph_rect.y), (x, graph_rect.bottom), 1)
+        
+        # Horizontal grid lines (volume markers)
+        num_h_lines = 4
+        for i in range(num_h_lines + 1):
+            y = graph_rect.y + (i / num_h_lines) * graph_rect.height
+            if i > 0 and i < num_h_lines:  # Skip first and last
+                pygame.draw.line(self.screen, Config.COLORS['border_light'], 
+                               (graph_rect.x, y), (graph_rect.right, y), 1)
+        
+        # Generate preview curve points with higher density for smoothness
+        points = []
+        fill_points = []  # For area under curve
+        num_points = min(graph_rect.width, 100)  # Higher density for smooth curve
+        
+        for i in range(num_points):
+            # Distance from min to max
+            t = i / (num_points - 1)
+            distance = self.distance_settings['min_distance'] + t * (
+                self.distance_settings['max_distance'] - self.distance_settings['min_distance'])
+            
+            # Calculate volume based on current algorithm
+            volume = self._calculate_volume_from_distance(distance)
+            
+            # Convert to screen coordinates
+            x = graph_rect.x + t * graph_rect.width
+            y = graph_rect.bottom - (volume / 100.0) * graph_rect.height
+            points.append((x, y))
+            fill_points.append((x, y))
+        
+        # Add bottom-right and bottom-left corners for filled area
+        if fill_points:
+            fill_points.append((graph_rect.right, graph_rect.bottom))
+            fill_points.append((graph_rect.x, graph_rect.bottom))
+        
+        # Draw filled area under curve with transparency
+        if len(fill_points) > 3:
+            # Create a surface for the filled area with alpha
+            fill_surface = pygame.Surface((graph_rect.width, graph_rect.height), pygame.SRCALPHA)
+            adjusted_fill_points = [(p[0] - graph_rect.x, p[1] - graph_rect.y) for p in fill_points]
+            pygame.draw.polygon(fill_surface, (*Config.COLORS['primary'][:3], 30), adjusted_fill_points)
+            self.screen.blit(fill_surface, (graph_rect.x, graph_rect.y))
+        
+        # Draw main curve with enhanced styling
+        if len(points) > 1:
+            pygame.draw.lines(self.screen, Config.COLORS['primary'], False, points, 3)
+            
+            # Add highlight points at key positions
+            key_positions = [0.0, 0.25, 0.5, 0.75, 1.0]
+            for pos in key_positions:
+                idx = int(pos * (len(points) - 1))
+                if 0 <= idx < len(points):
+                    x, y = points[idx]
+                    pygame.draw.circle(self.screen, Config.COLORS['primary'], (int(x), int(y)), 4)
+                    pygame.draw.circle(self.screen, Config.COLORS['text_light'], (int(x), int(y)), 2)
+        
+        # Enhanced axes with proper styling
+        # X-axis (bottom)
+        pygame.draw.line(self.screen, Config.COLORS['text_secondary'], 
+                        (graph_rect.x, graph_rect.bottom), 
+                        (graph_rect.right, graph_rect.bottom), 2)
+        # Y-axis (left)
+        pygame.draw.line(self.screen, Config.COLORS['text_secondary'],
+                        (graph_rect.x, graph_rect.y), 
+                        (graph_rect.x, graph_rect.bottom), 2)
+        
+        # Enhanced labels with better positioning
+        # X-axis labels (distance)
+        min_dist = self.distance_settings['min_distance']
+        max_dist = self.distance_settings['max_distance']
+        mid_dist = (min_dist + max_dist) / 2
+        
+        self.fonts['tiny'].render_to(self.screen, (graph_rect.x - 5, graph_rect.bottom + 3), 
+                                   f"{min_dist:.0f}m", Config.COLORS['text_muted'])
+        self.fonts['tiny'].render_to(self.screen, (graph_rect.x + graph_rect.width//2 - 10, graph_rect.bottom + 3), 
+                                   f"{mid_dist:.0f}m", Config.COLORS['text_muted'])
+        self.fonts['tiny'].render_to(self.screen, (graph_rect.right - 25, graph_rect.bottom + 3), 
+                                   f"{max_dist:.0f}m", Config.COLORS['text_muted'])
+        
+        # Y-axis labels (volume)
+        min_vol = self.distance_settings['min_volume']
+        max_vol = self.distance_settings['max_volume']
+        mid_vol = (min_vol + max_vol) / 2
+        
+        self.fonts['tiny'].render_to(self.screen, (graph_rect.x - 35, graph_rect.bottom - 5), 
+                                   f"{min_vol:.0f}%", Config.COLORS['text_muted'])
+        self.fonts['tiny'].render_to(self.screen, (graph_rect.x - 35, graph_rect.y + graph_rect.height//2 - 5), 
+                                   f"{mid_vol:.0f}%", Config.COLORS['text_muted'])
+        self.fonts['tiny'].render_to(self.screen, (graph_rect.x - 35, graph_rect.y - 5), 
+                                   f"{max_vol:.0f}%", Config.COLORS['text_muted'])
+        
+        # Axis titles
+        self.fonts['caption'].render_to(self.screen, (graph_rect.x + graph_rect.width//2 - 20, graph_rect.bottom + 15), 
+                                      "Distance", Config.COLORS['text_muted'])
+        # Rotate text for Y-axis would require more complex rendering, so we'll use a simple label
+        self.fonts['caption'].render_to(self.screen, (graph_rect.x - 35, graph_rect.y - 15), 
+                                      "Volume", Config.COLORS['text_muted'])
+
+    def _get_audio_duration_ms(self, file_path: str) -> int:
+        """Get audio file duration in milliseconds"""
+        try:
+            import pygame.mixer
+            if not pygame.mixer.get_init():
+                pygame.mixer.init()
+            
+            # Load sound to get duration
+            sound = pygame.mixer.Sound(file_path)
+            duration_seconds = sound.get_length()
+            return int(duration_seconds * 1000)  # Convert to milliseconds
+        except Exception:
+            return 0
+
+    def _render_mini_waveform(self, rect: pygame.Rect, file_path: str):
+        """Render a simplified waveform visualization"""
+        try:
+            # Simple waveform representation using file size as approximation
+            import os
+            file_size = os.path.getsize(file_path)
+            
+            # Generate pseudo-waveform based on file characteristics
+            waveform_rect = pygame.Rect(rect.x + 2, rect.y + 2, rect.width - 4, rect.height - 4)
+            
+            # Draw background
+            pygame.draw.rect(self.screen, Config.COLORS['surface_light'], waveform_rect, border_radius=2)
+            
+            # Simple waveform bars based on file size pattern
+            num_bars = min(waveform_rect.width // 3, 20)
+            bar_width = waveform_rect.width // num_bars
+            
+            for i in range(num_bars):
+                # Generate height based on file size and position (pseudo-random)
+                height_factor = ((file_size + i * 1000) % 100) / 100.0
+                bar_height = int(waveform_rect.height * height_factor * 0.8)
+                
+                bar_rect = pygame.Rect(
+                    waveform_rect.x + i * bar_width,
+                    waveform_rect.y + (waveform_rect.height - bar_height) // 2,
+                    bar_width - 1,
+                    bar_height
+                )
+                pygame.draw.rect(self.screen, Config.COLORS['primary'], bar_rect)
+                
+        except Exception:
+            # Fallback: simple rectangle
+            pygame.draw.rect(self.screen, Config.COLORS['surface_light'], rect, border_radius=2)
+            self.fonts['tiny'].render_to(self.screen, (rect.x + 5, rect.y + rect.height//2 - 4), 
+                                       "Audio", Config.COLORS['text_muted'])
+
+    def _calculate_volume_from_distance(self, distance: float) -> float:
+        """Calculate volume based on distance using current algorithm"""
+        try:
+            # Normalize distance to 0-1 range
+            min_dist = self.distance_settings['min_distance']
+            max_dist = self.distance_settings['max_distance']
+            
+            if distance <= min_dist:
+                return self.distance_settings['max_volume']
+            if distance >= max_dist:
+                return self.distance_settings['min_volume']
+            
+            # Calculate normalized distance (0 = min_distance, 1 = max_distance)
+            t = (distance - min_dist) / (max_dist - min_dist)
+            
+            # Apply algorithm
+            decay_type = self.distance_settings['decay_type']
+            steepness = self.distance_settings.get('steepness', 1.0)
+            
+            if decay_type == 'linear':
+                factor = 1.0 - t
+            elif decay_type == 'exponential':
+                factor = pow(2, -steepness * t)
+            elif decay_type == 'logarithmic':
+                factor = 1.0 - (math.log(1 + t * (math.e - 1)) / math.log(math.e))
+            elif decay_type == 'inverse_square':
+                actual_distance_ratio = 1.0 + t * steepness
+                factor = 1.0 / (actual_distance_ratio * actual_distance_ratio)
+                # Normalize to 0-1 range
+                max_factor = 1.0
+                min_factor = 1.0 / ((1.0 + steepness) ** 2)
+                factor = (factor - min_factor) / (max_factor - min_factor)
+            elif decay_type == 'sigmoid':
+                # S-curve using sigmoid function
+                x = (t - 0.5) * steepness * 2
+                factor = 1.0 / (1.0 + math.exp(x))
+            else:  # quadratic or custom
+                factor = (1.0 - t) ** steepness
+            
+            # Apply to volume range
+            min_vol = self.distance_settings['min_volume']
+            max_vol = self.distance_settings['max_volume']
+            volume = min_vol + factor * (max_vol - min_vol)
+            
+            return max(0, min(100, volume))
+            
+        except Exception:
+            return 50.0  # Fallback volume
 
     def cleanup(self):
         """Clean up UI resources"""

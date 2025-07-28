@@ -52,6 +52,7 @@ class BluetoothDeviceInfo:
     def __init__(self, address: str, name: str, device_class: int = 0, rssi: int = 0):
         self.address = address
         self.name = name if name else f"Unknown-{address[-5:].replace(':', '')}"
+        self.device_name = self.name  # For UI manager compatibility
         self.device_class = device_class
         self.rssi = rssi
         self.device = address  # For compatibility with ListPortInfo interface
@@ -66,8 +67,7 @@ class BluetoothDeviceInfo:
         """Enhanced HC-05 compatibility check with stricter filtering"""
         # Primary HC-05 patterns (high confidence)
         primary_patterns = [
-            'sensornode', 'hc-05', 'hc-06', 'hc05', 'hc06', 
-            'bt_anuron', 'linvor'
+            'SENSORNODEA', 'SENSORNODEB', 'SENSORNODEC'
         ]
         
         name_lower = self.name.lower()
@@ -128,12 +128,40 @@ class BluetoothDeviceInfo:
         
         return min(100, confidence)
 
+def safe_get_rssi(device) -> int:
+    """Safely extract RSSI from BLE device across different bleak versions"""
+    try:
+        # Direct attribute access (most common)
+        if hasattr(device, 'rssi') and device.rssi is not None:
+            return device.rssi
+        
+        # Metadata access (some versions)
+        if hasattr(device, 'metadata') and device.metadata:
+            if isinstance(device.metadata, dict):
+                return device.metadata.get('rssi', 0)
+            elif hasattr(device.metadata, 'get'):
+                return device.metadata.get('rssi', 0)
+        
+        # Details access (rare cases)
+        if hasattr(device, 'details') and hasattr(device.details, 'rssi'):
+            return device.details.rssi
+        
+        # Advertisement data access (alternative)
+        if hasattr(device, 'advertisement_data') and hasattr(device.advertisement_data, 'rssi'):
+            return device.advertisement_data.rssi
+            
+    except Exception as e:
+        print(f"RSSI extraction error for device {getattr(device, 'address', 'unknown')}: {e}")
+    
+    return 0  # Default fallback
+
 class DeviceScanner:
     """Enhanced modal window for scanning HC-05 Bluetooth and serial devices with scrolling."""
     
-    def __init__(self, parent_screen: pygame.Surface):
+    def __init__(self, parent_screen: pygame.Surface, device_type: str = "HC-05"):
         self.parent_screen = parent_screen
         self.parent_size = parent_screen.get_size()
+        self.device_type = device_type  # "HC-05" or "Moving Object"
         
         # Create modal surface
         self.screen = parent_screen
@@ -163,7 +191,13 @@ class DeviceScanner:
         # Scanner state
         self.available_devices: List[Any] = []
         self.selected_device_index: Optional[int] = None
-        self.status_message = "Click 'Scan HC-05' to find your SensorNode devices."
+        
+        # Set initial status message based on device type
+        if device_type == "Moving Object":
+            self.status_message = "Click 'Scan Moving' to find your moving object devices."
+        else:
+            self.status_message = "Click 'Scan HC-05' to find your SensorNode devices."
+            
         self.scanning = False
         self.running = True
         self.scan_type = "bluetooth"
@@ -263,7 +297,8 @@ class DeviceScanner:
                 
                 for device in devices:
                     device_name = device.name or f"Unknown-{device.address[-5:].replace(':', '')}"
-                    rssi = getattr(device, 'rssi', 0)
+                    # Safe RSSI access for different bleak versions
+                    rssi = safe_get_rssi(device)
                     
                     bt_device = BluetoothDeviceInfo(
                         address=device.address,
@@ -383,7 +418,8 @@ class DeviceScanner:
                 
                 for device in devices:
                     device_name = device.name or f"Unknown-{device.address[-5:].replace(':', '')}"
-                    rssi = getattr(device, 'rssi', 0)
+                    # Safe RSSI access for different bleak versions
+                    rssi = safe_get_rssi(device)
                     
                     bt_device = BluetoothDeviceInfo(
                         address=device.address,
@@ -508,7 +544,8 @@ class DeviceScanner:
                 
                 for device in devices:
                     device_name = device.name or f"Unknown-{device.address[-5:].replace(':', '')}"
-                    rssi = getattr(device, 'rssi', 0)
+                    # Safe RSSI access for different bleak versions
+                    rssi = safe_get_rssi(device)
                     
                     bt_device = BluetoothDeviceInfo(
                         address=device.address,
@@ -578,6 +615,155 @@ class DeviceScanner:
         except Exception as e:
             self.status_message = f"PyBluez HC-05 scan error: {str(e)}"
 
+    def _scan_for_moving_object_devices(self):
+        """Scans specifically for moving object devices with orientation/motion tracking."""
+        if self.scanning or not BLUETOOTH_AVAILABLE:
+            if not BLUETOOTH_AVAILABLE:
+                self.status_message = f"Bluetooth not available. Library: {BLUETOOTH_LIBRARY}"
+            return
+        
+        # Stop real-time scanning if active
+        if self.real_time_scanning:
+            self.stop_real_time_scanning()
+            
+        self.scanning = True
+        self.scan_type = "bluetooth"
+        self.hc05_only_mode = False  # Moving objects might use different naming
+        self.status_message = "Scanning for moving object devices (orientation/motion tracking)..."
+        self.available_devices = []
+        self.selected_device_index = None
+        self.scroll_offset = 0
+        
+        def moving_object_scan_worker():
+            try:
+                if BLUETOOTH_LIBRARY == "bleak":
+                    self._scan_moving_objects_with_bleak()
+                else:
+                    self._scan_moving_objects_with_pybluez()
+                    
+            except Exception as e:
+                self.status_message = f"Moving object scan error: {str(e)}"
+                print(f"Moving object scanning error: {e}")
+            
+            self.scanning = False
+            
+            # Auto-start real-time scanning after initial scan
+            if BLUETOOTH_AVAILABLE and len(self.available_devices) > 0:
+                time.sleep(1.0)  # Brief pause
+                self.start_real_time_scanning()
+        
+        scan_thread = threading.Thread(target=moving_object_scan_worker, daemon=True)
+        scan_thread.start()
+
+    def _scan_moving_objects_with_bleak(self):
+        """Scan for moving object devices with bleak - devices with gyroscope/motion capabilities"""
+        import asyncio
+        
+        async def bleak_moving_object_scan():
+            self.status_message = "Scanning for moving object devices..."
+            
+            try:
+                devices = await BleakScanner.discover(timeout=15.0)
+                
+                moving_devices = []
+                
+                print(f"📡 Found {len(devices)} total BLE devices")
+                
+                # Moving object device patterns (devices that might provide orientation data)
+                moving_patterns = [
+                    'BLUETOOTHCARIN', 'BLUETOOTHCAROUT'
+                ]
+                
+                for device in devices:
+                    device_name = device.name or f"Unknown-{device.address[-5:].replace(':', '')}"
+                    # Safe RSSI access for different bleak versions
+                    rssi = safe_get_rssi(device)
+                    
+                    bt_device = BluetoothDeviceInfo(
+                        address=device.address,
+                        name=device_name,
+                        rssi=rssi
+                    )
+                    
+                    # Check for moving object patterns in device name
+                    is_moving_device = any(
+                        pattern.lower() in device_name.lower() 
+                        for pattern in moving_patterns
+                    )
+                    
+                    # Also include devices with strong signal (likely nearby devices)
+                    is_nearby = rssi and rssi > -70
+                    
+                    if is_moving_device or is_nearby:
+                        moving_devices.append(bt_device)
+                        print(f"📱 Moving object candidate: {device_name} RSSI: {rssi}dBm")
+                
+                # Sort by signal strength (closest devices first)
+                moving_devices.sort(key=lambda d: d.rssi or -100, reverse=True)
+                
+                self.available_devices = moving_devices
+                self._update_scroll_limits()
+                
+                if not self.available_devices:
+                    self.status_message = "No moving object devices found. Make sure your device is powered and discoverable."
+                else:
+                    self.status_message = f"Found {len(self.available_devices)} potential moving object device(s). Select one to connect."
+                    
+            except Exception as e:
+                self.status_message = f"Moving object scan error: {str(e)}"
+                print(f"Moving object scanning error: {e}")
+        
+        try:
+            asyncio.run(bleak_moving_object_scan())
+        except Exception as e:
+            self.status_message = f"Scan error: {str(e)}"
+
+    def _scan_moving_objects_with_pybluez(self):
+        """Scan for moving object devices using pybluez"""
+        try:
+            import bluetooth
+            self.status_message = "Scanning for moving object devices (PyBluez mode)..."
+            
+            nearby_devices = bluetooth.discover_devices(
+                duration=10, lookup_names=True, flush_cache=True, lookup_class=True
+            )
+            
+            moving_devices = []
+            moving_patterns = [
+                'gyro', 'imu', 'motion', 'orient', 'accel', 'compass', 'mpu6050', 'mpu9250',
+                'movingobject', 'moving_object', 'tracker', 'sensor', 'esp', 'arduino',
+                'phone', 'mobile', 'tablet', 'watch', 'fitness', 'activity'
+            ]
+            
+            for addr, name, device_class in nearby_devices:
+                device_name = name if name else f"Unknown-{addr[-5:].replace(':', '')}"
+                
+                bt_device = BluetoothDeviceInfo(addr, device_name, device_class)
+                
+                # Check for moving object patterns
+                is_moving_device = any(
+                    pattern.lower() in device_name.lower() 
+                    for pattern in moving_patterns
+                )
+                
+                if is_moving_device or not name:  # Include unnamed devices (might be custom moving objects)
+                    moving_devices.append(bt_device)
+                    print(f"📱 Moving object candidate: {device_name}")
+            
+            # Sort by name
+            moving_devices.sort(key=lambda d: d.name)
+            
+            self.available_devices = moving_devices
+            self._update_scroll_limits()
+            
+            if not self.available_devices:
+                self.status_message = "No moving object devices found with PyBluez."
+            else:
+                self.status_message = f"Found {len(self.available_devices)} potential moving object device(s). Select one to connect."
+                
+        except Exception as e:
+            self.status_message = f"PyBluez moving object scan error: {str(e)}"
+
     def _scan_all_bluetooth_devices(self):
         """Scans for ALL Bluetooth devices (not filtered)."""
         if self.scanning or not BLUETOOTH_AVAILABLE:
@@ -630,7 +816,8 @@ class DeviceScanner:
                 
                 for device in devices:
                     device_name = device.name or f"Unknown-{device.address[-5:].replace(':', '')}"
-                    rssi = getattr(device, 'rssi', 0)
+                    # Safe RSSI access for different bleak versions
+                    rssi = safe_get_rssi(device)
                     
                     bt_device = BluetoothDeviceInfo(
                         address=device.address,
@@ -817,6 +1004,11 @@ class DeviceScanner:
                 self._scan_for_hc05_devices()
             return
 
+        if 'scan_moving' in self.button_rects and self.button_rects['scan_moving'].collidepoint(pos):
+            if not self.scanning:
+                self._scan_for_moving_object_devices()
+            return
+
         if 'scan_all_bluetooth' in self.button_rects and self.button_rects['scan_all_bluetooth'].collidepoint(pos):
             if not self.scanning:
                 self._scan_all_bluetooth_devices()
@@ -883,14 +1075,19 @@ class DeviceScanner:
         pygame.draw.line(self.modal_surface, COLORS['border'], 
                         header_rect.bottomleft, header_rect.bottomright, 2)
         
-        # Title
-        self.font_title.render_to(self.modal_surface, (PADDING, 15), 
-                                "🔵 HC-05 Device Scanner", COLORS['text_primary'])
-        
-        # Subtitle
-        subtitle = "SensorNode & HC-05 Bluetooth Discovery"
+        # Title and subtitle based on device type
+        if self.device_type == "Moving Object":
+            title = "📱 Moving Object Device Scanner"
+            subtitle = "Orientation & Motion Tracking Device Discovery"
+        else:
+            title = "🔵 HC-05 Device Scanner"
+            subtitle = "SensorNode & HC-05 Bluetooth Discovery"
+            
         if not BLUETOOTH_AVAILABLE:
             subtitle += f" (Bluetooth disabled - {BLUETOOTH_LIBRARY or 'no library'})"
+            
+        self.font_title.render_to(self.modal_surface, (PADDING, 15), 
+                                title, COLORS['text_primary'])
         self.font_small.render_to(self.modal_surface, (PADDING, 40), subtitle, COLORS['text_secondary'])
 
     def _render_status(self):
@@ -1072,10 +1269,16 @@ class DeviceScanner:
         
         # Bluetooth buttons (if available)
         if BLUETOOTH_AVAILABLE:
-            buttons.extend([
-                ('scan_hc05', 'Scan HC-05', COLORS['primary'], 20),
-                ('scan_all_bluetooth', 'Scan All BT', COLORS['warning'], 170),
-            ])
+            if self.device_type == "Moving Object":
+                buttons.extend([
+                    ('scan_moving', 'Scan Moving', COLORS['primary'], 20),
+                    ('scan_all_bluetooth', 'Scan All BT', COLORS['warning'], 170),
+                ])
+            else:
+                buttons.extend([
+                    ('scan_hc05', 'Scan HC-05', COLORS['primary'], 20),
+                    ('scan_all_bluetooth', 'Scan All BT', COLORS['warning'], 170),
+                ])
             
             # Real-time scanning toggle button
             realtime_text = 'Stop Real-time' if self.real_time_scanning else 'Real-time Scan'
@@ -1098,7 +1301,7 @@ class DeviceScanner:
                 btn_color = COLORS['surface_light']  # Disabled state
             elif btn_id == 'toggle_realtime' and not BLUETOOTH_AVAILABLE:
                 btn_color = COLORS['surface_light']  # Disabled if no Bluetooth
-            elif btn_id in ['scan_hc05', 'scan_all_bluetooth', 'scan_serial'] and self.scanning:
+            elif btn_id in ['scan_hc05', 'scan_moving', 'scan_all_bluetooth', 'scan_serial'] and self.scanning:
                 btn_color = COLORS['surface_light']  # Disabled while scanning
             
             button_rect = pygame.Rect(btn_x, button_y, button_width, button_height)
@@ -1109,7 +1312,7 @@ class DeviceScanner:
                 can_interact = False
             elif btn_id == 'toggle_realtime' and not BLUETOOTH_AVAILABLE:
                 can_interact = False
-            elif btn_id in ['scan_hc05', 'scan_all_bluetooth', 'scan_serial'] and self.scanning:
+            elif btn_id in ['scan_hc05', 'scan_moving', 'scan_all_bluetooth', 'scan_serial'] and self.scanning:
                 can_interact = False
             
             if button_rect.collidepoint(self.mouse_pos) and can_interact:
@@ -1137,7 +1340,10 @@ class DeviceScanner:
         instruction_y = POPUP_HEIGHT - 40
         
         if BLUETOOTH_AVAILABLE:
-            instructions = "Real-time: Auto-updates devices • HC-05: Find SensorNodes • All BT: Show all • Scroll: Mouse wheel • Enter: Connect"
+            if self.device_type == "Moving Object":
+                instructions = "Real-time: Auto-updates devices • Moving: Find orientation devices • All BT: Show all • Scroll: Mouse wheel • Enter: Connect"
+            else:
+                instructions = "Real-time: Auto-updates devices • HC-05: Find SensorNodes • All BT: Show all • Scroll: Mouse wheel • Enter: Connect"
         else:
             instructions = "Install bleak for Bluetooth real-time scanning • Serial: USB connections • Enter: Connect • Esc: Cancel"
         

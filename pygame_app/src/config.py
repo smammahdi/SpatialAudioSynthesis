@@ -131,6 +131,20 @@ class Config:
         'synthesis_quality': 'high'
     }
     
+    # Debug settings - control debug output for different subsystems
+    DEBUG = {
+        'PRINT_DISTANCE_UPDATES': False,    # Frequent distance updates from sensors
+        'PRINT_VOLUME_CHANGES': False,      # Volume level changes
+        'PRINT_DEVICE_SCANNING': True,      # Device discovery and connection
+        'PRINT_AUDIO_EVENTS': True,         # Audio playback events
+        'PRINT_UI_INTERACTIONS': True,      # UI button clicks and interactions
+        'PRINT_BLUETOOTH_EVENTS': True,     # Bluetooth connection events
+        'PRINT_VALIDATION_ERRORS': True,    # Input validation failures
+        'PRINT_SYSTEM_STARTUP': True,       # Application initialization
+        'PRINT_PERFORMANCE_METRICS': False, # Performance timing data
+        'PRINT_FILE_OPERATIONS': True,      # File upload/download operations
+    }
+    
     # UI states
     UI_STATES = {
         'collapsed_height': 40,
