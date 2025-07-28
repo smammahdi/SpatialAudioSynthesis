@@ -43,7 +43,6 @@ class SimulationPage:
         # Sensor nodes on the grid
         self.sensor_nodes: Dict[str, SensorNode] = {}
         
-        
         # Grid properties
         self.grid_margin = 40
         self.grid_origin = Point2D(
@@ -62,7 +61,6 @@ class SimulationPage:
         # Visualization settings
         self.show_circles = True
         self.show_triangle = True
-        self.show_excircle = True
         self.show_orientation = True
         self.show_grid = True
         
@@ -109,7 +107,6 @@ class SimulationPage:
             'grid_lines': (40, 50, 65),
             'circle': (70, 130, 200, 60),  # Semi-transparent
             'triangle': (220, 180, 80),
-            'excircle': (180, 80, 180),
             'orientation': (80, 220, 120),
             'node': (70, 130, 200),
             'text': (240, 245, 250),
@@ -262,7 +259,7 @@ class SimulationPage:
         y_pos = y_start
         
         # Section background
-        section_height = 190
+        section_height = 170  # Reduced height since we removed excircle
         section_rect = pygame.Rect(rect.x + 5, y_pos, rect.width - 10, section_height)
         pygame.draw.rect(self.screen, (25, 30, 40), section_rect, border_radius=5)
         pygame.draw.rect(self.screen, self.colors['border'], section_rect, 1, border_radius=5)
@@ -277,7 +274,6 @@ class SimulationPage:
             ('show_grid', 'Show Grid', self.show_grid),
             ('show_circles', 'Distance Circles', self.show_circles),
             ('show_triangle', 'Min Area Triangle', self.show_triangle),
-            ('show_excircle', 'Excircle', self.show_excircle),
             ('show_orientation', 'Orientation', self.show_orientation)
         ]
         
@@ -338,10 +334,6 @@ class SimulationPage:
             self.last_sensor_count = len(devices)
         
         for i, device in enumerate(devices):
-            # Show all devices, no artificial limit
-            # if y_pos + 80 > rect.bottom - 130:  # Reserve space for moving object status
-            #     break
-            
             # Device card
             card_rect = pygame.Rect(rect.x + 10, y_pos, rect.width - 20, 75)
             pygame.draw.rect(self.screen, (40, 48, 62), card_rect, border_radius=5)
@@ -608,11 +600,9 @@ class SimulationPage:
         if len(active_nodes) >= 3:
             nodes = active_nodes[:3]
             
-            # Perform trilateration directly - no throttling
-            result = self._perform_trilateration(nodes, distances, force_log=True)
+            # Perform trilateration directly
+            result = self._perform_trilateration(nodes, distances)
             if result:
-                # Use the optimized position calculated by trilateration method
-                # This is already the best position found by the minimum area triangle optimization
                 self.moving_object_position = result['position']
                 
                 # Draw visualization layers
@@ -622,18 +612,13 @@ class SimulationPage:
                 if self.show_triangle and 'triangle' in result and result['triangle'] is not None:
                     self._draw_triangle_of_interest(result['triangle'])
                 
-                if self.show_excircle and 'excircle' in result:
-                    self._draw_approx_circle(result['excircle'])
-                
                 # Draw estimated car with physical dimensions (includes orientation)
                 if 'car_dimensions' in result:
-                    self._draw_estimated_car(self.moving_object_position, result['car_dimensions'])
+                    is_fallback = result.get('is_fallback', False) or result.get('triangle') is None
+                    self._draw_estimated_car(self.moving_object_position, result['car_dimensions'], is_fallback)
                 elif self.show_orientation and self.moving_object_position:
                     # Fallback: draw simple orientation if no car dimensions available
                     self._draw_orientation(self.moving_object_position)
-        
-        # Note: Demo moving object is no longer drawn on the simulation graph
-        # It's only shown in the bottom left status section
     
     def _draw_grid_lines(self, rect: pygame.Rect):
         """Draw improved grid lines with proper labels and range"""
@@ -777,8 +762,6 @@ class SimulationPage:
                 if (x + radius >= grid_left and x - radius <= grid_right and 
                     y + radius >= grid_top and y - radius <= grid_bottom):
                     
-                    # Clipping will be done manually without creating a rect
-                    
                     # Draw circle with clipping
                     circle_surface = pygame.Surface((int(radius * 2 + 2), int(radius * 2 + 2)), pygame.SRCALPHA)
                     pygame.draw.circle(circle_surface, (*node.color, 40), 
@@ -800,13 +783,10 @@ class SimulationPage:
                         source_rect = pygame.Rect(source_x, source_y, clip_w, clip_h)
                         self.screen.blit(circle_surface, (clip_x, clip_y), source_rect)
     
-    def _perform_trilateration(self, nodes: List[SensorNode], distances: List[float], force_log: bool = False) -> Optional[Dict]:
+    def _perform_trilateration(self, nodes: List[SensorNode], distances: List[float]) -> Optional[Dict]:
         """
-        ENHANCED MINIMUM AREA TRIANGLE ALGORITHM:
-        1. Adaptive sampling based on circle proximity
-        2. Physics-based constraint validation  
-        3. Multi-objective optimization (area + feasibility)
-        4. Robust handling of overlapping circles
+        ROBUST MINIMUM AREA TRIANGLE ALGORITHM:
+        Find the smallest valid triangle formed by points on the three distance circles.
         """
         if len(nodes) < 3 or len(distances) < 3:
             return None
@@ -820,456 +800,154 @@ class SimulationPage:
         p1, p2, p3 = nodes[:3]
         r1, r2, r3 = distances[:3]
         
-        if force_log:
-            print(f"🔧 Enhanced Minimum Area Triangle Algorithm")
-            print(f"📍 Distance circles:")
-            print(f"   Circle 1: center=({p1.position.x:.1f}, {p1.position.y:.1f}), radius={r1:.1f}cm")
-            print(f"   Circle 2: center=({p2.position.x:.1f}, {p2.position.y:.1f}), radius={r2:.1f}cm")
-            print(f"   Circle 3: center=({p3.position.x:.1f}, {p3.position.y:.1f}), radius={r3:.1f}cm")
-            print(f"🚗 Car dimensions: {CAR_LENGTH}×{CAR_WIDTH}cm (radius: {CAR_RADIUS:.1f}cm)")
+        # Only log once per second to avoid spam
+        current_time = pygame.time.get_ticks()
+        should_log = not hasattr(self, '_last_trilateration_log') or current_time - self._last_trilateration_log > 2000
+        if should_log:
+            self._last_trilateration_log = current_time
+            print(f"\n🔧 Trilateration Algorithm")
+            print(f"📍 Sensors: P1=({p1.position.x:.1f},{p1.position.y:.1f},r={r1:.1f}), " +
+                  f"P2=({p2.position.x:.1f},{p2.position.y:.1f},r={r2:.1f}), " +
+                  f"P3=({p3.position.x:.1f},{p3.position.y:.1f},r={r3:.1f})")
         
-        # Adaptive sampling based on circle proximity and sizes
-        base_samples = 16  # Minimum samples per circle
-        proximity_factor = self._calculate_circle_proximity_factor(
-            [(p1.position, r1), (p2.position, r2), (p3.position, r3)]
-        )
-        adaptive_samples = max(base_samples, min(32, int(base_samples * proximity_factor)))
+        # First try analytical circle intersections for robustness
+        intersection_candidates = []
         
-        if force_log:
-            print(f"📊 Adaptive sampling: {adaptive_samples} points per circle (proximity factor: {proximity_factor:.2f})")
+        # Find all pairwise circle intersections
+        int_12 = self._circle_intersections(p1.position, r1, p2.position, r2)
+        int_13 = self._circle_intersections(p1.position, r1, p3.position, r3)
+        int_23 = self._circle_intersections(p2.position, r2, p3.position, r3)
         
-        # Sample points on each distance circle perimeter
-        circle1_points = self._sample_circle_points(p1.position, r1, adaptive_samples)
-        circle2_points = self._sample_circle_points(p2.position, r2, adaptive_samples)  
-        circle3_points = self._sample_circle_points(p3.position, r3, adaptive_samples)
+        # Collect all intersection points and calculate their error relative to all three circles
+        all_intersections = []
+        if int_12:
+            all_intersections.extend(int_12)
+        if int_13:
+            all_intersections.extend(int_13)
+        if int_23:
+            all_intersections.extend(int_23)
         
-        # Enhanced triangle evaluation with multiple criteria
-        best_result = {
-            'triangle': None,
-            'area': float('inf'),
-            'score': float('-inf'),  # Combined score
-            'car_center': None
-        }
+        if all_intersections:
+            for point in all_intersections:
+                # Calculate total error for this point relative to all three circles
+                error1 = abs(point.distance_to(p1.position) - r1)
+                error2 = abs(point.distance_to(p2.position) - r2)
+                error3 = abs(point.distance_to(p3.position) - r3)
+                total_error = error1 + error2 + error3
+                intersection_candidates.append((point, total_error))
+            
+            # Sort by total error
+            intersection_candidates.sort(key=lambda x: x[1])
+            
+            # If the best intersection point has low error, use it
+            if intersection_candidates[0][1] < 5.0:  # 5cm total error threshold
+                best_point = intersection_candidates[0][0]
+                if should_log:
+                    print(f"✅ Using analytical intersection with error: {intersection_candidates[0][1]:.1f}cm")
+                    print(f"🚗 Car position: ({best_point.x:.1f}, {best_point.y:.1f})")
+                
+                return {
+                    'position': best_point,
+                    'triangle': None,  # No triangle visualization for analytical solution
+                    'car_dimensions': {'length': CAR_LENGTH, 'width': CAR_WIDTH, 'radius': CAR_RADIUS}
+                }
         
-        tested_combinations = 0
-        max_combinations = 8000  # Performance limit
+        # If analytical approach fails, use minimum area triangle approach
+        # Sample fewer points for efficiency but ensure good coverage
+        samples_per_circle = 24
+        circle1_points = self._sample_circle_points(p1.position, r1, samples_per_circle)
+        circle2_points = self._sample_circle_points(p2.position, r2, samples_per_circle)  
+        circle3_points = self._sample_circle_points(p3.position, r3, samples_per_circle)
         
-        if force_log:
-            total_possible = len(circle1_points) * len(circle2_points) * len(circle3_points)
-            print(f"🔍 Testing up to {min(total_possible, max_combinations)} combinations...")
+        best_triangle = None
+        min_area = float('inf')
+        best_centroid = None
+        valid_count = 0
         
-        # Try all combinations with early termination
-        for p1_point in circle1_points:
-            for p2_point in circle2_points:
-                for p3_point in circle3_points:
-                    tested_combinations += 1
-                    if tested_combinations > max_combinations:
-                        break
-                        
-                    # Calculate triangle properties
-                    triangle_vertices = [p1_point, p2_point, p3_point]
-                    area = self._triangle_area(p1_point, p2_point, p3_point)
+        # More reasonable minimum area threshold
+        MIN_TRIANGLE_AREA = 100.0  # cm² - larger minimum to avoid degenerate triangles
+        MIN_SIDE_LENGTH = 15.0     # cm - minimum distance between any two points
+        
+        # Smart sampling: don't check every combination, sample strategically
+        sample_step = max(1, samples_per_circle // 8)  # Check every 8th point for efficiency
+        
+        for i in range(0, samples_per_circle, sample_step):
+            pt1 = circle1_points[i]
+            for j in range(0, samples_per_circle, sample_step):
+                pt2 = circle2_points[j]
+                
+                # Quick distance check
+                if pt1.distance_to(pt2) < MIN_SIDE_LENGTH:
+                    continue
+                    
+                for k in range(0, samples_per_circle, sample_step):
+                    pt3 = circle3_points[k]
+                    
+                    # Check minimum distances between all points
+                    d12 = pt1.distance_to(pt2)
+                    d23 = pt2.distance_to(pt3)
+                    d13 = pt1.distance_to(pt3)
+                    
+                    if d23 < MIN_SIDE_LENGTH or d13 < MIN_SIDE_LENGTH:
+                        continue
+                    
+                    # Calculate triangle area
+                    area = self._triangle_area(pt1, pt2, pt3)
                     
                     # Skip degenerate triangles
-                    if area < 10.0:  # Reduced minimum area for demo mode
+                    if area < MIN_TRIANGLE_AREA:
                         continue
                     
-                    # Calculate potential car center (triangle centroid)
-                    car_center = Point2D(
-                        sum(p.x for p in triangle_vertices) / 3,
-                        sum(p.y for p in triangle_vertices) / 3
-                    )
+                    valid_count += 1
                     
-                    # Physics-based constraint validation (more lenient for demo)
-                    if not self._is_valid_car_position(car_center, 
-                                                     [(p1.position, r1), (p2.position, r2), (p3.position, r3)], 
-                                                     CAR_RADIUS, tolerance=10.0):  # Increased tolerance
-                        continue
-                    
-                    # Multi-objective scoring
-                    score = self._calculate_triangle_score(triangle_vertices, car_center, area, 
-                                                         [(p1.position, r1), (p2.position, r2), (p3.position, r3)])
-                    
-                    # Update best solution
-                    if score > best_result['score']:
-                        best_result.update({
-                            'triangle': triangle_vertices,
-                            'area': area,
-                            'score': score,
-                            'car_center': car_center
-                        })
-                        
-                        # Early termination for excellent solutions
-                        if area < 100.0 and score > 0.9:  # Very good solution
-                            if force_log:
-                                print(f"⚡ Early termination: excellent solution found (area: {area:.1f}cm², score: {score:.3f})")
-                            break
-                if tested_combinations > max_combinations:
-                    break
-            if tested_combinations > max_combinations or (best_result['triangle'] and best_result['area'] < 100.0):
-                break
+                    # Update best triangle if this one has smaller area
+                    if area < min_area:
+                        min_area = area
+                        best_triangle = [pt1, pt2, pt3]
+                        # Calculate centroid
+                        best_centroid = Point2D(
+                            (pt1.x + pt2.x + pt3.x) / 3,
+                            (pt1.y + pt2.y + pt3.y) / 3
+                        )
         
-        # Process best solution
-        if best_result['triangle']:
-            triangle = best_result['triangle']
-            car_center = best_result['car_center']
-            area = best_result['area']
-            score = best_result['score']
-            
-            # Calculate excircle for visualization
-            excircle = self._calculate_excircle(triangle)
-            
-            if force_log:
-                print(f"✅ Enhanced algorithm found optimal triangle")
-                print(f"🎯 Triangle area: {area:.2f} cm² (score: {score:.3f})")
-                print(f"🚗 Car center: ({car_center.x:.1f}, {car_center.y:.1f})")
-                print(f"� Tested {tested_combinations} combinations")
-                print(f"� Triangle vertices:")
-                for i, vertex in enumerate(triangle, 1):
-                    print(f"   P{i}: ({vertex.x:.1f}, {vertex.y:.1f})")
-            
-            # Verify vertices are on circle perimeters (enhanced validation)
-            sensors = [(p1.position, r1), (p2.position, r2), (p3.position, r3)]
-            for i, (vertex, (sensor_pos, radius)) in enumerate(zip(triangle, sensors), 1):
-                dist_to_sensor = vertex.distance_to(sensor_pos)
-                error = abs(dist_to_sensor - radius)
-                status = "✅" if error <= 2.0 else "⚠️"
-                if force_log:
-                    print(f"   {status} P{i} distance to sensor: {dist_to_sensor:.2f}cm (target: {radius:.2f}cm, error: {error:.2f}cm)")
-            
-            if excircle and force_log:
-                print(f"   Excircle: center=({excircle['center'].x:.1f}, {excircle['center'].y:.1f}), radius={excircle['radius']:.1f}cm")
+        if best_triangle and best_centroid:
+            if should_log:
+                print(f"✅ Found minimum area triangle (area: {min_area:.1f} cm², {valid_count} valid triangles)")
+                print(f"🚗 Car position: ({best_centroid.x:.1f}, {best_centroid.y:.1f})")
             
             return {
-                'position': car_center,
-                'triangle': triangle,
-                'excircle': excircle,
-                'algorithm_info': {
-                    'type': 'enhanced_minimum_area',
-                    'area': area,
-                    'score': score,
-                    'samples_per_circle': adaptive_samples,
-                    'combinations_tested': tested_combinations
-                },
+                'position': best_centroid,
+                'triangle': best_triangle,
                 'car_dimensions': {'length': CAR_LENGTH, 'width': CAR_WIDTH, 'radius': CAR_RADIUS}
             }
-        else:
-            if force_log:
-                print(f"❌ Enhanced algorithm found no valid solution - using fallback")
-                print(f"   Tested {tested_combinations} combinations")
-            
-            # Fallback: use geometric center with physics validation
-            center_x = (p1.position.x + p2.position.x + p3.position.x) / 3
-            center_y = (p1.position.y + p2.position.y + p3.position.y) / 3
-            fallback_position = Point2D(center_x, center_y)
-            
-            return {
-                'position': fallback_position,
-                'triangle': None,
-                'excircle': None,
-                'car_dimensions': {'length': CAR_LENGTH, 'width': CAR_WIDTH, 'radius': CAR_RADIUS}
-            }
-    
-    def _calculate_circle_proximity_factor(self, circles: List[tuple]) -> float:
-        """
-        Calculate proximity factor for adaptive sampling.
-        Returns higher value when circles are closer together.
-        """
-        proximities = []
-        for i in range(len(circles)):
-            for j in range(i + 1, len(circles)):
-                center1, r1 = circles[i]
-                center2, r2 = circles[j]
-                
-                # Distance between centers
-                center_dist = center1.distance_to(center2)
-                
-                # Normalized proximity (closer = higher value)
-                # If circles overlap significantly, increase sampling
-                if center_dist < (r1 + r2):  # Overlapping or touching
-                    proximity = 2.0 + (r1 + r2 - center_dist) / max(r1, r2)
-                else:
-                    proximity = max(0.5, (r1 + r2) / center_dist)
-                
-                proximities.append(proximity)
         
-        return max(1.0, sum(proximities) / len(proximities))
-    
-    def _is_valid_car_position(self, car_center: Point2D, sensor_distances: List[tuple], 
-                              car_radius: float, tolerance: float = 3.0) -> bool:
-        """
-        Physics-based validation for car position.
-        Checks if the car can physically exist at this position given sensor measurements.
-        """
-        for sensor_pos, measured_distance in sensor_distances:
-            # Distance from car center to sensor
-            actual_distance = car_center.distance_to(sensor_pos)
-            
-            # For a car with radius car_radius, the sensor should measure
-            # somewhere between (actual_distance - car_radius) and (actual_distance + car_radius)
-            min_expected = max(0, actual_distance - car_radius - tolerance)
-            max_expected = actual_distance + car_radius + tolerance
-            
-            # Check if measured distance is within expected range
-            if not (min_expected <= measured_distance <= max_expected):
-                return False
+        # Final fallback: weighted centroid
+        if should_log:
+            print(f"⚠️ No valid triangles found, using fallback")
         
-        return True
-    
-    def _calculate_triangle_score(self, triangle: List[Point2D], car_center: Point2D, 
-                                area: float, sensor_distances: List[tuple]) -> float:
-        """
-        Multi-objective scoring for triangle quality.
-        Higher score = better triangle.
-        """
-        # Base score from area (smaller area is better)
-        area_score = max(0, 1.0 - area / 1000.0)  # Normalize to 0-1 range
+        # Simple weighted position based on inverse distance
+        total_weight = 0
+        weighted_x = 0
+        weighted_y = 0
         
-        # Physics consistency score
-        physics_score = 1.0
-        for sensor_pos, measured_distance in sensor_distances:
-            actual_distance = car_center.distance_to(sensor_pos)
-            error = abs(actual_distance - measured_distance)
-            physics_score *= max(0.1, 1.0 - error / 50.0)  # Penalize large errors
+        for i, (pos, radius) in enumerate([(p1.position, r1), (p2.position, r2), (p3.position, r3)]):
+            # Weight inversely proportional to distance (closer sensors have more influence)
+            weight = 1.0 / max(radius, 1.0)  # Avoid division by zero
+            total_weight += weight
+            weighted_x += pos.x * weight
+            weighted_y += pos.y * weight
         
-        # Triangle regularity score (more regular = better)
-        side_lengths = [
-            triangle[0].distance_to(triangle[1]),
-            triangle[1].distance_to(triangle[2]),
-            triangle[2].distance_to(triangle[0])
-        ]
-        max_side = max(side_lengths)
-        min_side = min(side_lengths)
-        regularity_score = min_side / max_side if max_side > 0 else 0
+        fallback_position = Point2D(weighted_x / total_weight, weighted_y / total_weight)
         
-        # Combined score with weights
-        combined_score = (0.4 * area_score + 
-                         0.4 * physics_score + 
-                         0.2 * regularity_score)
-        
-        return combined_score
-    
-    def _find_outer_tangent_circle(self, c1: Point2D, r1: float, c2: Point2D, r2: float, c3: Point2D, r3: float) -> Optional[Dict]:
-        """
-        Find the outer tangent circle using a geometric optimization approach.
-        This is more robust than Descartes Circle Theorem for practical cases.
-        """
-        try:
-            # Check for zero or negative radii
-            if r1 <= 0 or r2 <= 0 or r3 <= 0:
-                return None
-            
-            # Simple approach: Use circumcircle of sensor positions and expand outward
-            # This will give us a reasonable approximation of the outer tangent circle
-            
-            # Calculate circumcenter of the three sensor nodes
-            d = 2 * (c1.x * (c2.y - c3.y) + c2.x * (c3.y - c1.y) + c3.x * (c1.y - c2.y))
-            
-            if abs(d) < 1e-10:  # Collinear points
-                return None
-                
-            ux = ((c1.x*c1.x + c1.y*c1.y) * (c2.y - c3.y) + 
-                  (c2.x*c2.x + c2.y*c2.y) * (c3.y - c1.y) + 
-                  (c3.x*c3.x + c3.y*c3.y) * (c1.y - c2.y)) / d
-            
-            uy = ((c1.x*c1.x + c1.y*c1.y) * (c3.x - c2.x) + 
-                  (c2.x*c2.x + c2.y*c2.y) * (c1.x - c3.x) + 
-                  (c3.x*c3.x + c3.y*c3.y) * (c2.x - c1.x)) / d
-            
-            circumcenter = Point2D(ux, uy)
-            
-            # Calculate distances from circumcenter to each circle center
-            dist_to_c1 = circumcenter.distance_to(c1)
-            dist_to_c2 = circumcenter.distance_to(c2)
-            dist_to_c3 = circumcenter.distance_to(c3)
-            
-            # The key insight: for an outer tangent circle, we need a much larger radius
-            # The outer tangent circle should encompass all the distance circles
-            
-            # Method 1: Try to use circumcenter if it's outside all circles
-            all_outside = (dist_to_c1 > r1 and dist_to_c2 > r2 and dist_to_c3 > r3)
-            
-            # FIXED: Proper outer radius calculation using bounding box approach
-            # Calculate the bounding box of all circles (including their radii)
-            min_x = min(c1.x - r1, c2.x - r2, c3.x - r3)
-            max_x = max(c1.x + r1, c2.x + r2, c3.x + r3)
-            min_y = min(c1.y - r1, c2.y - r2, c3.y - r3)
-            max_y = max(c1.y + r1, c2.y + r2, c3.y + r3)
-            
-            # Calculate the diagonal of the bounding box
-            bbox_width = max_x - min_x
-            bbox_height = max_y - min_y
-            bbox_diagonal = math.sqrt(bbox_width**2 + bbox_height**2)
-            
-            # Use the circumcenter if it's reasonable, otherwise use bounding box center
-            center = circumcenter
-            
-            if all_outside:
-                # Good case: circumcenter is outside all circles
-                required_radii = [
-                    dist_to_c1 - r1,  # Radius needed for external tangency with circle 1
-                    dist_to_c2 - r2,  # Radius needed for external tangency with circle 2  
-                    dist_to_c3 - r3   # Radius needed for external tangency with circle 3
-                ]
-                # Use the maximum to ensure external tangency with all circles
-                outer_radius = max(required_radii) + 5.0  # Add 5cm margin
-            else:
-                # Fallback: circumcenter is inside some circles, use bounding box approach
-                center = Point2D((min_x + max_x) / 2, (min_y + max_y) / 2)
-                
-                # Calculate radius needed to encompass all circles from bounding box center
-                dist_to_c1_new = center.distance_to(c1)
-                dist_to_c2_new = center.distance_to(c2)
-                dist_to_c3_new = center.distance_to(c3)
-                
-                required_radii = [
-                    dist_to_c1_new + r1 + 10,  # Ensure we're outside circle 1 with 10cm margin
-                    dist_to_c2_new + r2 + 10,  # Ensure we're outside circle 2 with 10cm margin
-                    dist_to_c3_new + r3 + 10   # Ensure we're outside circle 3 with 10cm margin
-                ]
-                
-                outer_radius = max(required_radii)
-            
-            # Ensure minimum reasonable radius
-            outer_radius = max(outer_radius, bbox_diagonal / 2)
-            
-            # Verify the solution by checking distances
-            dist1 = center.distance_to(c1)
-            dist2 = center.distance_to(c2)
-            dist3 = center.distance_to(c3)
-            
-            expected_dist1 = outer_radius + r1
-            expected_dist2 = outer_radius + r2  
-            expected_dist3 = outer_radius + r3
-            
-            # Use a reasonable tolerance (20cm) for this approximation method
-            tolerance = 20.0
-            
-            # Check if the solution is reasonable (not necessarily perfect)
-            reasonable = (
-                abs(dist1 - expected_dist1) < tolerance and 
-                abs(dist2 - expected_dist2) < tolerance and
-                abs(dist3 - expected_dist3) < tolerance
-            )
-            
-            if reasonable or outer_radius > bbox_diagonal / 3:  # Accept if reasonable or large enough
-                return {
-                    'center': center,
-                    'radius': outer_radius
-                }
-            
-            return None
-            
-        except (ZeroDivisionError, ValueError, OverflowError):
-            return None
-    
-    def _find_external_tangent_point(self, outer_center: Point2D, outer_radius: float, 
-                                   circle_center: Point2D, circle_radius: float) -> Optional[Point2D]:
-        """
-        Find the point where the outer tangent circle touches a distance circle externally.
-        """
-        try:
-            # Distance between centers
-            distance = outer_center.distance_to(circle_center)
-            
-            if distance < 1e-6:  # Centers are too close
-                return None
-            
-            # For external tangency, the tangent point lies on the line connecting the centers
-            # Distance from circle center to tangent point equals the circle radius
-            # Direction from outer center to circle center
-            direction_x = (circle_center.x - outer_center.x) / distance
-            direction_y = (circle_center.y - outer_center.y) / distance
-            
-            # Tangent point is circle_radius distance from circle center towards outer center
-            tangent_x = circle_center.x - circle_radius * direction_x
-            tangent_y = circle_center.y - circle_radius * direction_y
-            
-            return Point2D(tangent_x, tangent_y)
-            
-        except (ZeroDivisionError, ValueError):
-            return None
-    
-    def _calculate_excircle(self, triangle_vertices: List[Point2D]) -> Optional[Dict]:
-        """Calculate the excircle (circumcircle) of a triangle."""
-        if len(triangle_vertices) != 3:
-            return None
-        
-        p1, p2, p3 = triangle_vertices
-        
-        # Calculate circumcenter using the formula
-        ax, ay = p1.x, p1.y
-        bx, by = p2.x, p2.y
-        cx, cy = p3.x, p3.y
-        
-        D = 2 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
-        
-        if abs(D) < 1e-6:  # Degenerate triangle
-            return None
-        
-        ux = ((ax*ax + ay*ay) * (by - cy) + (bx*bx + by*by) * (cy - ay) + (cx*cx + cy*cy) * (ay - by)) / D
-        uy = ((ax*ax + ay*ay) * (cx - bx) + (bx*bx + by*by) * (ax - cx) + (cx*cx + cy*cy) * (bx - ax)) / D
-        
-        center = Point2D(ux, uy)
-        radius = center.distance_to(p1)
+        if should_log:
+            print(f"📍 Fallback position: ({fallback_position.x:.1f}, {fallback_position.y:.1f})")
         
         return {
-            'center': center,
-            'radius': radius
+            'position': fallback_position,
+            'triangle': None,
+            'car_dimensions': {'length': CAR_LENGTH, 'width': CAR_WIDTH, 'radius': CAR_RADIUS},
+            'is_fallback': True
         }
-    
-    def _is_triangle_outside_circles(self, triangle_vertices: List[Point2D], sensor_positions: List[Point2D], radii: List[float]) -> bool:
-        """Check if all triangle vertices are outside their respective distance circles."""
-        if len(triangle_vertices) != 3 or len(sensor_positions) != 3 or len(radii) != 3:
-            return False
-        
-        for i, vertex in enumerate(triangle_vertices):
-            sensor_pos = sensor_positions[i]
-            radius = radii[i]
-            distance_to_sensor = vertex.distance_to(sensor_pos)
-            
-            # Vertex should be outside the distance circle (with small tolerance)
-            if distance_to_sensor <= radius + 1.0:  # 1cm tolerance
-                return False
-        
-        return True
-    
-    def _calculate_excircle(self, triangle_vertices: List[Point2D]) -> Optional[Dict]:
-        """Calculate the excircle (circumcircle) of a triangle."""
-        if len(triangle_vertices) != 3:
-            return None
-        
-        p1, p2, p3 = triangle_vertices
-        
-        # Calculate circumcenter using the formula
-        ax, ay = p1.x, p1.y
-        bx, by = p2.x, p2.y
-        cx, cy = p3.x, p3.y
-        
-        D = 2 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
-        
-        if abs(D) < 1e-6:  # Degenerate triangle
-            return None
-        
-        ux = ((ax*ax + ay*ay) * (by - cy) + (bx*bx + by*by) * (cy - ay) + (cx*cx + cy*cy) * (ay - by)) / D
-        uy = ((ax*ax + ay*ay) * (cx - bx) + (bx*bx + by*by) * (ax - cx) + (cx*cx + cy*cy) * (bx - ax)) / D
-        
-        center = Point2D(ux, uy)
-        radius = center.distance_to(p1)
-        
-        return {
-            'center': center,
-            'radius': radius
-        }
-
-    def _is_triangle_outside_circles(self, triangle_vertices: List[Point2D], sensor_positions: List[Point2D], radii: List[float]) -> bool:
-        """Check if triangle is completely outside all distance circles"""
-        for vertex in triangle_vertices:
-            for sensor_pos, radius in zip(sensor_positions, radii):
-                distance = vertex.distance_to(sensor_pos)
-                if distance < radius:  # Vertex is inside a circle
-                    return False
-        return True
     
     def _sample_circle_points(self, center: Point2D, radius: float, num_samples: int = 24) -> List[Point2D]:
         """Sample points uniformly around a circle"""
@@ -1281,170 +959,8 @@ class SimulationPage:
             points.append(Point2D(x, y))
         return points
     
-    def _find_optimal_car_position(self, triangle_vertices: List[Point2D], sensor_positions: List[Point2D], distances: List[float], car_radius: float) -> Optional[Point2D]:
-        """
-        Find the optimal car center position within a triangle that satisfies distance constraints.
-        The car center must be at least (measured_distance + car_radius) from each sensor.
-        """
-        if len(triangle_vertices) != 3 or len(sensor_positions) != 3 or len(distances) != 3:
-            return None
-        
-        # Start with triangle centroid as initial estimate
-        centroid = Point2D(
-            sum(p.x for p in triangle_vertices) / 3,
-            sum(p.y for p in triangle_vertices) / 3
-        )
-        
-        # Check if centroid satisfies distance constraints
-        if self._verify_car_position(centroid, sensor_positions, distances, car_radius):
-            return centroid
-        
-        # If centroid doesn't work, try to find a valid position within the triangle
-        # Sample points within the triangle and find the one closest to centroid that satisfies constraints
-        best_position = None
-        min_distance_to_centroid = float('inf')
-        
-        # Generate candidate points within the triangle using barycentric coordinates
-        for alpha in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
-            for beta in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
-                gamma = 1.0 - alpha - beta
-                if gamma > 0:  # Valid barycentric coordinates
-                    # Calculate point using barycentric coordinates
-                    candidate = Point2D(
-                        alpha * triangle_vertices[0].x + beta * triangle_vertices[1].x + gamma * triangle_vertices[2].x,
-                        alpha * triangle_vertices[0].y + beta * triangle_vertices[1].y + gamma * triangle_vertices[2].y
-                    )
-                    
-                    if self._verify_car_position(candidate, sensor_positions, distances, car_radius):
-                        distance_to_centroid = candidate.distance_to(centroid)
-                        if distance_to_centroid < min_distance_to_centroid:
-                            min_distance_to_centroid = distance_to_centroid
-                            best_position = candidate
-        
-        return best_position
-    
-    def _verify_car_position(self, car_center: Point2D, sensor_positions: List[Point2D], distances: List[float], car_radius: float) -> bool:
-        """
-        Verify that a car center position satisfies distance constraints.
-        The car center must be at least (measured_distance + car_radius) from each sensor.
-        """
-        tolerance = 2.0  # 2cm tolerance
-        
-        for sensor_pos, measured_distance in zip(sensor_positions, distances):
-            distance_to_sensor = car_center.distance_to(sensor_pos)
-            required_distance = measured_distance + car_radius
-            
-            # Car center must be far enough from sensor
-            if distance_to_sensor < required_distance - tolerance:
-                return False
-        
-        return True
-    
-    def _adjust_center_for_constraints(self, initial_center: Point2D, sensor_positions: List[Point2D], distances: List[float], car_radius: float) -> Point2D:
-        """
-        Adjust an initial car center position to satisfy distance constraints.
-        Move the center away from sensors that are too close.
-        """
-        adjusted_center = Point2D(initial_center.x, initial_center.y)
-        max_iterations = 10
-        
-        for iteration in range(max_iterations):
-            needs_adjustment = False
-            total_adjustment_x = 0.0
-            total_adjustment_y = 0.0
-            
-            for sensor_pos, measured_distance in zip(sensor_positions, distances):
-                distance_to_sensor = adjusted_center.distance_to(sensor_pos)
-                required_distance = measured_distance + car_radius
-                
-                if distance_to_sensor < required_distance:
-                    needs_adjustment = True
-                    
-                    # Calculate adjustment vector (move away from sensor)
-                    if distance_to_sensor > 0:
-                        adjustment_magnitude = required_distance - distance_to_sensor + 5.0  # 5cm buffer
-                        direction_x = (adjusted_center.x - sensor_pos.x) / distance_to_sensor
-                        direction_y = (adjusted_center.y - sensor_pos.y) / distance_to_sensor
-                        
-                        total_adjustment_x += direction_x * adjustment_magnitude
-                        total_adjustment_y += direction_y * adjustment_magnitude
-            
-            if not needs_adjustment:
-                break
-                
-            # Apply adjustments
-            adjusted_center = Point2D(
-                adjusted_center.x + total_adjustment_x / len(sensor_positions),
-                adjusted_center.y + total_adjustment_y / len(sensor_positions)
-            )
-        
-        return adjusted_center
-    
-    def _triangle_fits_in_car(self, triangle_vertices: List[Point2D], car_center: Point2D, car_radius: float) -> bool:
-        """
-        Check if a triangle fits entirely within the car's boundaries.
-        Since the car CONTAINS the triangle, all triangle vertices must be within car_radius of car_center.
-        """
-        if len(triangle_vertices) != 3:
-            return False
-        
-        # Check that all triangle vertices are within the car's radius
-        for vertex in triangle_vertices:
-            distance_from_car_center = vertex.distance_to(car_center)
-            if distance_from_car_center > car_radius:
-                return False
-        
-        return True
-    
-    def _analytical_trilateration(self, p1: Point2D, r1: float, p2: Point2D, r2: float, p3: Point2D, r3: float) -> List[Point2D]:
-        """
-        Perform analytical trilateration to find intersection points of three circles.
-        Returns a list of candidate positions where all three circles intersect.
-        """
-        try:
-            # Convert to matrix form for solving the trilateration equations
-            # Circle equations: (x-p1.x)² + (y-p1.y)² = r1²
-            # Expanding and rearranging gives us a system of linear equations
-            
-            # Use the first circle as reference, solve relative to other two
-            A = 2 * (p2.x - p1.x)
-            B = 2 * (p2.y - p1.y)
-            C = r1*r1 - r2*r2 - p1.x*p1.x + p2.x*p2.x - p1.y*p1.y + p2.y*p2.y
-            
-            D = 2 * (p3.x - p1.x)  
-            E = 2 * (p3.y - p1.y)
-            F = r1*r1 - r3*r3 - p1.x*p1.x + p3.x*p3.x - p1.y*p1.y + p3.y*p3.y
-            
-            # Solve the system: Ax + By = C, Dx + Ey = F
-            denominator = A * E - B * D
-            
-            if abs(denominator) < 1e-10:
-                # Lines are parallel, no unique solution
-                return []
-            
-            x = (C * E - F * B) / denominator
-            y = (A * F - D * C) / denominator
-            
-            # Verify this point is actually on all three circles (within tolerance)
-            tolerance = 1.0  # cm
-            solution = Point2D(x, y)
-            
-            dist1 = solution.distance_to(p1)
-            dist2 = solution.distance_to(p2)
-            dist3 = solution.distance_to(p3)
-            
-            if (abs(dist1 - r1) <= tolerance and 
-                abs(dist2 - r2) <= tolerance and 
-                abs(dist3 - r3) <= tolerance):
-                return [solution]
-            else:
-                return []
-                
-        except Exception:
-            return []
-    
     def _circle_intersections(self, c1: Point2D, r1: float, c2: Point2D, r2: float) -> Optional[List[Point2D]]:
-        """Find intersection points of two circles (legacy method, kept for reference)"""
+        """Find intersection points of two circles"""
         d = c1.distance_to(c2)
         
         # Check if circles intersect
@@ -1483,76 +999,10 @@ class SimulationPage:
         """Calculate area of a triangle using cross product"""
         return abs((p2.x - p1.x) * (p3.y - p1.y) - (p3.x - p1.x) * (p2.y - p1.y)) / 2
     
-    def _point_in_triangle(self, point: Point2D, p1: Point2D, p2: Point2D, p3: Point2D) -> bool:
-        """Check if a point is inside a triangle using barycentric coordinates"""
-        # Calculate vectors
-        v0x, v0y = p3.x - p1.x, p3.y - p1.y
-        v1x, v1y = p2.x - p1.x, p2.y - p1.y
-        v2x, v2y = point.x - p1.x, point.y - p1.y
-        
-        # Calculate dot products
-        dot00 = v0x * v0x + v0y * v0y
-        dot01 = v0x * v1x + v0y * v1y
-        dot02 = v0x * v2x + v0y * v2y
-        dot11 = v1x * v1x + v1y * v1y
-        dot12 = v1x * v2x + v1y * v2y
-        
-        # Calculate barycentric coordinates
-        denom = dot00 * dot11 - dot01 * dot01
-        if abs(denom) < 1e-10:  # Degenerate triangle
-            return False
-            
-        inv_denom = 1.0 / denom
-        u = (dot11 * dot02 - dot01 * dot12) * inv_denom
-        v = (dot00 * dot12 - dot01 * dot02) * inv_denom
-        
-        # Check if point is in triangle
-        return (u >= 0) and (v >= 0) and (u + v <= 1)
-    
-    def _calculate_excircle(self, triangle: List[Point2D]) -> Optional[Dict]:
-        """Calculate the excircle (circumcircle) of a triangle with improved robustness"""
-        if not triangle or len(triangle) != 3:
-            return None
-            
-        p1, p2, p3 = triangle
-        
-        # Calculate circumcenter using more stable algorithm
-        try:
-            d = 2 * (p1.x * (p2.y - p3.y) + p2.x * (p3.y - p1.y) + p3.x * (p1.y - p2.y))
-            
-            # Check for degenerate triangle (collinear points)
-            if abs(d) < 0.1:  # Increased threshold for practical stability
-                return None
-            
-            ux = ((p1.x*p1.x + p1.y*p1.y) * (p2.y - p3.y) + 
-                  (p2.x*p2.x + p2.y*p2.y) * (p3.y - p1.y) + 
-                  (p3.x*p3.x + p3.y*p3.y) * (p1.y - p2.y)) / d
-            
-            uy = ((p1.x*p1.x + p1.y*p1.y) * (p3.x - p2.x) + 
-                  (p2.x*p2.x + p2.y*p2.y) * (p1.x - p3.x) + 
-                  (p3.x*p3.x + p3.y*p3.y) * (p2.x - p1.x)) / d
-            
-            center = Point2D(ux, uy)
-            radius = center.distance_to(p1)
-            
-            # Sanity checks for reasonable excircle
-            if radius > 1000 or radius <= 0:  # Very large or invalid radius
-                return None
-            
-            # Check if center is too far from triangle vertices
-            max_distance = max(center.distance_to(p1), center.distance_to(p2), center.distance_to(p3))
-            if max_distance > 500:  # Center too far from triangle
-                return None
-            
-            return {'center': center, 'radius': radius}
-            
-        except (ZeroDivisionError, ValueError, OverflowError):
-            return None
-    
     def _draw_triangle_of_interest(self, triangle: List[Point2D]):
-        """Draw the support triangle (closest points on distance circles)"""
+        """Draw the minimum area triangle"""
         if not triangle or len(triangle) < 3:
-            return  # Quietly skip invalid triangles
+            return
         
         points = []
         for p in triangle:
@@ -1561,44 +1011,55 @@ class SimulationPage:
             points.append((int(x), int(y)))
         
         if len(points) >= 3:
+            # Calculate the actual triangle area in cm² for coloring
+            p1, p2, p3 = triangle[:3]
+            area = self._triangle_area(p1, p2, p3)
+            
+            # Color triangle based on quality (green = good, yellow = okay, orange = acceptable)
+            if area > 500:  # Large triangle = good
+                triangle_color = (100, 255, 100)  # Green
+                alpha = 60
+            elif area > 200:  # Medium triangle = okay
+                triangle_color = (255, 255, 100)  # Yellow
+                alpha = 80
+            else:  # Small triangle = acceptable but not ideal
+                triangle_color = (255, 200, 100)  # Orange
+                alpha = 100
+            
             # Create a surface for the filled triangle with transparency
-            triangle_surface = pygame.Surface((800, 600), pygame.SRCALPHA)
-            pygame.draw.polygon(triangle_surface, (*self.colors['triangle'], 80), points)
+            triangle_surface = pygame.Surface((self.screen.get_width(), self.screen.get_height()), pygame.SRCALPHA)
+            pygame.draw.polygon(triangle_surface, (*triangle_color, alpha), points)
             self.screen.blit(triangle_surface, (0, 0))
             
-            # Draw triangle outline (solid)
-            pygame.draw.polygon(self.screen, self.colors['triangle'], points, 4)
+            # Draw triangle outline (solid) - thicker for visibility
+            pygame.draw.polygon(self.screen, triangle_color, points, 3)
             
-            # Draw vertices as small circles
+            # Draw vertices as circles
             for i, (x, y) in enumerate(points):
-                pygame.draw.circle(self.screen, self.colors['triangle'], (int(x), int(y)), 6)
-                # Label vertices
-                self.fonts['tiny'].render_to(self.screen, (x + 10, y - 10), 
-                                           f"P{i+1}", self.colors['text'])
-        else:
-            print(f"❌ DEBUG: Not enough points to draw triangle: {points}")
-    
-    def _draw_approx_circle(self, excircle: Dict):
-        """Draw the excircle of the triangle, clipped to grid boundaries"""
-        if not excircle or 'center' not in excircle or 'radius' not in excircle:
-            return  # Quietly skip invalid excircles
-        
-        center = excircle['center']
-        radius = excircle['radius']
-        
-        x = self.grid_origin.x + center.x * self.pixels_per_cm_x
-        y = self.grid_origin.y - center.y * self.pixels_per_cm_y
-        r = radius * self.pixels_per_cm_x  # Use x scale for radius
-        
-        # Sanity check for reasonable drawing parameters
-        if r > 0 and r < 2000 and abs(x) < 5000 and abs(y) < 5000:
-            # Draw the excircle
-            pygame.draw.circle(self.screen, self.colors['excircle'], (int(x), int(y)), int(r), 3)
+                # Larger circles for better visibility
+                pygame.draw.circle(self.screen, triangle_color, (int(x), int(y)), 8)
+                pygame.draw.circle(self.screen, (255, 255, 255), (int(x), int(y)), 8, 2)
+                
+                # Label vertices with background for better readability
+                label = f"P{i+1}"
+                text_rect = self.fonts['tiny'].get_rect(label)
+                bg_rect = pygame.Rect(x + 12, y - 12, text_rect.width + 4, text_rect.height + 2)
+                pygame.draw.rect(self.screen, (*self.colors['surface'], 200), bg_rect, border_radius=2)
+                self.fonts['tiny'].render_to(self.screen, (x + 14, y - 10), 
+                                           label, self.colors['text'])
             
-            # Draw center point for debugging
-            pygame.draw.circle(self.screen, self.colors['excircle'], (int(x), int(y)), 3)
+            # Add area label in center of triangle
+            centroid_x = sum(x for x, y in points) // 3
+            centroid_y = sum(y for x, y in points) // 3
+            area_label = f"Area: {area:.0f}cm²"
+            text_rect = self.fonts['tiny'].get_rect(area_label)
+            bg_rect = pygame.Rect(centroid_x - text_rect.width//2 - 2, centroid_y - text_rect.height//2 - 1, 
+                                text_rect.width + 4, text_rect.height + 2)
+            pygame.draw.rect(self.screen, (*self.colors['surface'], 220), bg_rect, border_radius=2)
+            self.fonts['tiny'].render_to(self.screen, (centroid_x - text_rect.width//2, centroid_y - text_rect.height//2), 
+                                       area_label, triangle_color)
     
-    def _draw_estimated_car(self, position: Point2D, car_dims: Dict):
+    def _draw_estimated_car(self, position: Point2D, car_dims: Dict, is_fallback: bool = False):
         """Draw the estimated car position using the car image"""
         if not position or not car_dims:
             return
@@ -1637,11 +1098,12 @@ class SimulationPage:
             
             # Draw the car with semi-transparency to show it's estimated
             car_surface = rotated_car.copy()
-            car_surface.set_alpha(180)  # Make it semi-transparent
+            car_surface.set_alpha(180 if not is_fallback else 100)  # More transparent if fallback
             self.screen.blit(car_surface, car_rect)
             
-            # Draw outline
-            pygame.draw.rect(self.screen, (255, 217, 61), car_rect, 2)
+            # Draw outline - red if fallback, yellow if normal
+            outline_color = (220, 80, 80) if is_fallback else (255, 217, 61)
+            pygame.draw.rect(self.screen, outline_color, car_rect, 2)
             
         else:
             # Fallback to rectangle if car image not available
@@ -1674,16 +1136,23 @@ class SimulationPage:
                 screen_y = center_y + rotated_y
                 rotated_corners.append((screen_x, screen_y))
             
-            # Draw car body
-            pygame.draw.polygon(self.screen, (255, 217, 61, 120), rotated_corners)  # Semi-transparent yellow
-            pygame.draw.polygon(self.screen, (255, 217, 61), rotated_corners, 3)    # Yellow outline
+            # Draw car body - red tint if fallback
+            fill_color = (220, 80, 80, 120) if is_fallback else (255, 217, 61, 120)
+            outline_color = (220, 80, 80) if is_fallback else (255, 217, 61)
+            
+            pygame.draw.polygon(self.screen, fill_color, rotated_corners)  # Semi-transparent
+            pygame.draw.polygon(self.screen, outline_color, rotated_corners, 3)    # Outline
         
         # Label
-        label = f"Car Center ({position.x:.1f}, {position.y:.1f})"
-        text_rect = pygame.Rect(center_x - 50, center_y - 25, 100, 15)
+        status_text = " (Fallback)" if is_fallback else ""
+        label = f"Car Center ({position.x:.1f}, {position.y:.1f}){status_text}"
+        text_rect = pygame.Rect(center_x - 80, center_y - 25, 160, 15)
         pygame.draw.rect(self.screen, (*self.colors['surface'], 200), text_rect, border_radius=3)
-        self.fonts['tiny'].render_to(self.screen, (center_x - 45, center_y - 20), 
-                                   label, self.colors['text'])
+        
+        label_color = (220, 80, 80) if is_fallback else self.colors['text']
+        text_width = self.fonts['tiny'].get_rect(label).width
+        self.fonts['tiny'].render_to(self.screen, (center_x - text_width // 2, center_y - 20), 
+                                   label, label_color)
     
     def _draw_orientation(self, position: Point2D):
         """Draw the moving object with car image rotated based on orientation"""
@@ -1705,13 +1174,8 @@ class SimulationPage:
             
             # Draw the rotated car
             self.screen.blit(rotated_car, car_rect)
-            
-            # Debug: Only print occasionally to avoid spam
-            if int(current_orientation) % 15 == 0:  # Print every 15 degrees
-                print(f"🚗 Car at ({position.x:.1f}, {position.y:.1f}) facing {current_orientation:.0f}°")
         else:
             # Fallback to arrow if car image failed to load
-            print(f"⚠️ Car image not loaded, using arrow fallback at {current_orientation:.1f}°")
             arrow_length = 30
             
             # Calculate arrow end point (0° = up, positive = clockwise)
@@ -1740,90 +1204,9 @@ class SimulationPage:
                                (int(left_x), int(left_y)), 
                                (int(right_x), int(right_y))])
             
-            right_angle = angle_rad - math.radians(head_angle)
-            right_x = end_x - head_length * math.cos(right_angle)
-            right_y = end_y - head_length * math.sin(right_angle)
-            
-            pygame.draw.polygon(self.screen, self.colors['orientation'], 
-                              [(int(end_x), int(end_y)), 
-                               (int(left_x), int(left_y)), 
-                               (int(right_x), int(right_y))])
-            
             # Object circle
             pygame.draw.circle(self.screen, self.colors['orientation'], 
                              (int(x), int(y)), 5)
-    
-    def _draw_demo_moving_object(self):
-        """Draw the demo moving object using the car image"""
-        if not self.demo_moving_object['enabled']:
-            return
-        
-        pos = self.demo_moving_object['position']
-        orientation = self.demo_moving_object['orientation']
-        
-        # Convert to screen coordinates using INDEPENDENT X/Y scaling
-        x = self.grid_origin.x + pos.x * self.pixels_per_cm_x
-        y = self.grid_origin.y - pos.y * self.pixels_per_cm_y
-        
-        if self.car_image:
-            # Use the actual car image and rotate it
-            # 0° = no rotation (car points up), positive angles = counterclockwise rotation
-            rotated_car = pygame.transform.rotate(self.car_image, orientation)  # Positive for counterclockwise
-            
-            # Get the rotated image rect and center it on the position
-            car_rect = rotated_car.get_rect()
-            car_rect.center = (int(x), int(y))
-            
-            # Draw shadow first
-            shadow_offset = 2
-            shadow_rect = rotated_car.get_rect(center=(int(x + shadow_offset), int(y + shadow_offset)))
-            shadow_surface = pygame.Surface(rotated_car.get_size(), pygame.SRCALPHA)
-            shadow_surface.fill((0, 0, 0, 50))
-            self.screen.blit(shadow_surface, shadow_rect)
-            
-            # Draw the car
-            self.screen.blit(rotated_car, car_rect)
-        else:
-            # Fallback to simple rectangle if car image not available
-            car_width, car_height = 40, 25
-            
-            # Create car surface
-            car_surface = pygame.Surface((car_width, car_height), pygame.SRCALPHA)
-            
-            # Car body (main rectangle)
-            body_rect = pygame.Rect(2, 2, car_width - 4, car_height - 4)
-            pygame.draw.rect(car_surface, (70, 130, 200), body_rect, border_radius=8)
-            pygame.draw.rect(car_surface, (240, 245, 250), body_rect, 2, border_radius=8)
-            
-            # Front bumper (to show orientation)
-            front_rect = pygame.Rect(car_width - 8, car_height // 2 - 6, 6, 12)
-            pygame.draw.rect(car_surface, (255, 217, 61), front_rect, border_radius=3)
-            
-            # Rotate the car surface
-            rotated_car = pygame.transform.rotate(car_surface, orientation)  # Positive for counterclockwise
-            
-            # Get the rect and center it
-            car_rect = rotated_car.get_rect(center=(int(x), int(y)))
-            
-            # Draw shadow first
-            shadow_surface = pygame.Surface(rotated_car.get_size(), pygame.SRCALPHA)
-            shadow_surface.fill((0, 0, 0, 50))
-            shadow_rect = shadow_surface.get_rect(center=(int(x + 2), int(y + 2)))
-            self.screen.blit(shadow_surface, shadow_rect)
-            
-            # Draw the car
-            self.screen.blit(rotated_car, car_rect)
-        
-        # Draw position indicator
-        pygame.draw.circle(self.screen, (255, 217, 61), (int(x), int(y)), 3)
-        
-        # Show coordinates
-        coord_text = f"({pos.x:.0f}, {pos.y:.0f})"
-        text_rect = self.fonts['tiny'].get_rect(coord_text)
-        bg_rect = pygame.Rect(x - text_rect.width // 2 - 2, y - 40, text_rect.width + 4, text_rect.height + 2)
-        pygame.draw.rect(self.screen, (*self.colors['surface'], 200), bg_rect, border_radius=3)
-        self.fonts['tiny'].render_to(self.screen, (x - text_rect.width // 2, y - 39), 
-                                   coord_text, self.colors['text'])
     
     def _render_button(self, rect: pygame.Rect, key: str, text: str, color):
         """Render a button"""
@@ -1890,9 +1273,6 @@ class SimulationPage:
                     
                     if self.dragging_node in self.sensor_nodes:
                         self.sensor_nodes[self.dragging_node].position = Point2D(grid_x, grid_y)
-                        # Only provide feedback every few pixels to avoid spam
-                        if int(event.pos[0]) % 10 == 0:  # Reduce logging frequency
-                            print(f"📍 Dragging {self.dragging_node} to ({grid_x:.1f}, {grid_y:.1f})")
         
         elif event.type == pygame.MOUSEBUTTONDOWN:
             if event.button == 1:  # Left click
@@ -1905,8 +1285,6 @@ class SimulationPage:
                             self.show_circles = not self.show_circles
                         elif key == 'show_triangle':
                             self.show_triangle = not self.show_triangle
-                        elif key == 'show_excircle':
-                            self.show_excircle = not self.show_excircle
                         elif key == 'show_orientation':
                             self.show_orientation = not self.show_orientation
                         return
@@ -1939,9 +1317,35 @@ class SimulationPage:
                 if 'toggle_demo' in self.button_rects and self.button_rects['toggle_demo'].collidepoint(event.pos):
                     self.demo_moving_object['enabled'] = not self.demo_moving_object['enabled']
                     if self.demo_moving_object['enabled']:
-                        # Start demo in center of grid
-                        self.demo_moving_object['position'] = Point2D(self.grid_range_x / 2, self.grid_range_y / 2)
+                        # Start demo at a position that makes sense for the sensor configuration
+                        # Try to start near where the circles would intersect
+                        sensor_devices = [device for device in self.device_manager.devices.values() 
+                                        if device.device_type != "moving_object"]
+                        
+                        if len(sensor_devices) >= 3 and all(device.device_id in self.sensor_nodes for device in sensor_devices[:3]):
+                            # Get first 3 sensor positions
+                            s1 = self.sensor_nodes[sensor_devices[0].device_id].position
+                            s2 = self.sensor_nodes[sensor_devices[1].device_id].position
+                            s3 = self.sensor_nodes[sensor_devices[2].device_id].position
+                            
+                            # Start at weighted center, slightly offset toward the middle
+                            center_x = (s1.x + s2.x + s3.x) / 3
+                            center_y = (s1.y + s2.y + s3.y) / 3
+                            
+                            # Move slightly toward grid center for better initial position
+                            grid_center_x = self.grid_range_x / 2
+                            grid_center_y = self.grid_range_y / 2
+                            
+                            start_x = center_x * 0.7 + grid_center_x * 0.3
+                            start_y = center_y * 0.7 + grid_center_y * 0.3
+                            
+                            self.demo_moving_object['position'] = Point2D(start_x, start_y)
+                        else:
+                            # Default to center of grid
+                            self.demo_moving_object['position'] = Point2D(self.grid_range_x / 2, self.grid_range_y / 2)
+                        
                         self.demo_moving_object['orientation'] = 0.0  # Up direction (0° = north/up)
+                        print(f"Demo started at position: ({self.demo_moving_object['position'].x:.1f}, {self.demo_moving_object['position'].y:.1f})")
                     return
                 
                 # Toggle distance mode button
@@ -2090,10 +1494,6 @@ class SimulationPage:
                             # Convert mouse position to grid coordinates with INDEPENDENT X/Y scaling
                             grid_x = (event.pos[0] - self.grid_origin.x) / self.pixels_per_cm_x
                             grid_y = (self.grid_origin.y - event.pos[1]) / self.pixels_per_cm_y
-                            
-                            print(f"🔍 Debug placement: mouse=({event.pos[0]}, {event.pos[1]}), origin=({self.grid_origin.x}, {self.grid_origin.y})")
-                            print(f"🔍 Scaling: x_scale={self.pixels_per_cm_x:.2f}, y_scale={self.pixels_per_cm_y:.2f}")
-                            print(f"🔍 Raw grid coords: ({grid_x:.1f}, {grid_y:.1f})")
                             
                             # Add margin from edges to keep nodes fully visible - MUCH SMALLER MARGIN
                             margin = 5  # 5cm margin from edges - reduce from 10cm
