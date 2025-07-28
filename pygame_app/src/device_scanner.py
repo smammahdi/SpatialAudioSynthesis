@@ -10,6 +10,11 @@ import time
 from typing import List, Optional, Tuple, Dict, Any
 from serial.tools.list_ports_common import ListPortInfo
 
+# Import centralized logging configuration
+from .logging_config import (
+    log_device, log_bluetooth, log_device_scanner, log_system, log_error
+)
+
 # Try to import bluetooth functionality
 try:
     import bleak
@@ -24,7 +29,7 @@ except ImportError:
     except ImportError:
         BLUETOOTH_AVAILABLE = False
         BLUETOOTH_LIBRARY = None
-        print("❌ No Bluetooth library available. Install with: pip install bleak")
+        log_error("❌ No Bluetooth library available. Install with: pip install bleak")
 
 # Configuration for the popup window
 POPUP_WIDTH = 900
@@ -259,7 +264,7 @@ class DeviceScanner:
         self.real_time_thread = threading.Thread(target=real_time_worker, daemon=True)
         self.real_time_thread.start()
         
-        print("✅ Real-time Bluetooth scanning started")
+        log_device_scanner("✅ Real-time Bluetooth scanning started")
 
     def stop_real_time_scanning(self):
         """Stop continuous real-time scanning"""
@@ -272,7 +277,7 @@ class DeviceScanner:
         if self.real_time_thread:
             self.real_time_thread.join(timeout=2.0)
         
-        print("✅ Real-time Bluetooth scanning stopped")
+        log_device_scanner("✅ Real-time Bluetooth scanning stopped")
 
     def _real_time_hc05_scan(self):
         """Real-time HC-05 device scanning with change detection"""
@@ -557,7 +562,7 @@ class DeviceScanner:
                     if bt_device.is_hc05_compatible and bt_device.hc05_confidence >= 30:
                         hc05_devices.append(bt_device)
                         confidence_str = f"({bt_device.hc05_confidence}% confidence)"
-                        print(f"📱 HC-05 device: {device_name} {confidence_str} RSSI: {rssi}dBm")
+                        log_bluetooth(f"📱 HC-05 device: {device_name} {confidence_str} RSSI: {rssi}dBm")
                 
                 # Sort by HC-05 confidence (highest first)
                 hc05_devices.sort(key=lambda d: d.hc05_confidence, reverse=True)

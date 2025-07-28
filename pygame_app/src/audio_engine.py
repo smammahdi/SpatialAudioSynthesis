@@ -16,6 +16,11 @@ from enum import Enum
 import wave
 import json
 
+# Import centralized logging configuration
+from .logging_config import (
+    log_audio, log_audio_engine, log_audio_file, log_system, log_error
+)
+
 class AudioFileType(Enum):
     SINE_WAVE = "sine_wave"
     AUDIO_FILE = "audio_file"
@@ -72,16 +77,10 @@ class SpatialAudioEngine:
         
         # Initialize pygame mixer with optimal settings
         try:
-            pygame.mixer.quit()  # Ensure clean state
-            pygame.mixer.init(
-                frequency=self.sample_rate,
-                size=-16,  # 16-bit signed
-                channels=2,  # Stereo
-                buffer=self.buffer_size
-            )
-            print(f"Audio engine initialized: {self.sample_rate}Hz, {self.buffer_size} buffer")
+            pygame.mixer.init(frequency=self.sample_rate, buffer=self.buffer_size)
+            log_audio_engine(f"Audio engine initialized: {self.sample_rate}Hz, {self.buffer_size} buffer")
         except Exception as e:
-            print(f"Audio initialization error: {e}")
+            log_error(f"Audio initialization error: {e}")
             # Fallback initialization
             pygame.mixer.init()
             
@@ -91,7 +90,7 @@ class SpatialAudioEngine:
         # Start real-time audio processing
         self._start_audio_processing()
         
-        print("Enhanced Spatial Audio Engine initialized")
+        log_system("Enhanced Spatial Audio Engine initialized")
         
     def _create_default_sources(self):
         """Create default sine wave audio sources with better variety"""
@@ -257,7 +256,7 @@ class SpatialAudioEngine:
                 
                 if time_since_start >= channel.audio_duration:
                     # Audio finished!
-                    print(f"✅ Audio finished for device {channel.device_id}: {channel.audio_source.name}")
+                    log_audio(f"✅ Audio finished for device {channel.device_id}: {channel.audio_source.name}")
                     
                     # Check if we have pending parameters (new distance-based audio)
                     if (channel.pending_volume is not None or 
@@ -274,7 +273,7 @@ class SpatialAudioEngine:
                             channel.pending_frequency = None
                         
                         # Start new audio cycle with current parameters
-                        print(f"🔄 Starting next audio cycle for device {channel.device_id}")
+                        log_audio(f"🔄 Starting next audio cycle for device {channel.device_id}")
                         self._start_audio_playback(channel, 0.5)  # Default duration for distance-based audio
                     else:
                         # No pending updates, mark as not playing
@@ -453,7 +452,7 @@ class SpatialAudioEngine:
                 repeats = (samples_needed // current_samples) + 1
                 audio_data = np.tile(audio_data, repeats)[:samples_needed]
             
-            print(f"🎵 Playing file audio: {audio_source.name} ({duration:.1f}s, {len(audio_data)} samples)")
+            log_audio(f"🎵 Playing file audio: {audio_source.name} ({duration:.1f}s, {len(audio_data)} samples)")
             return audio_data
             
         except Exception as e:
@@ -539,7 +538,7 @@ class SpatialAudioEngine:
                     channel.current_frequency = frequency
                     channel.last_update = current_time
                     
-                    print(f"🎵 Device {device_id}: Starting '{audio_source.name}' (ID: {audio_source.id}) at volume {volume:.2f}")
+                    log_audio(f"🎵 Device {device_id}: Starting '{audio_source.name}' (ID: {audio_source.id}) at volume {volume:.2f}")
                     self._start_audio_playback(channel, duration)
                 else:
                     # Audio still playing - store pending parameters
@@ -554,7 +553,7 @@ class SpatialAudioEngine:
                     
                     # Debug: Show remaining time
                     remaining_time = channel.audio_duration - time_since_start
-                    print(f"⏳ Device {device_id}: Audio playing, {remaining_time:.1f}s remaining")
+                    log_audio(f"⏳ Device {device_id}: Audio playing, {remaining_time:.1f}s remaining")
                 
         except Exception as e:
             print(f"Audio synthesis error: {e}")
@@ -575,7 +574,7 @@ class SpatialAudioEngine:
             channel.audio_duration = actual_duration
             channel.is_playing = True
             
-            print(f"🎬 Starting audio: {channel.audio_source.name} ({actual_duration:.1f}s duration)")
+            log_audio(f"🎬 Starting audio: {channel.audio_source.name} ({actual_duration:.1f}s duration)")
             
             # Play the audio
             if not self.mixing_enabled:

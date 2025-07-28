@@ -9,6 +9,12 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
+# Import centralized logging configuration
+from .logging_config import (
+    log_simulation, log_trilateration, log_position, log_grid, 
+    log_ui, log_input, log_demo, log_system, log_error
+)
+
 from .grid_range_editor import GridRangeEditor
 from .coordinate_editor import CoordinateEditor
 
@@ -159,7 +165,7 @@ class SimulationPage:
         sensor_devices = [device for device in self.device_manager.devices.values() 
                          if device.device_type != "moving_object"][:3]
         
-        print(f"🔍 Initializing sensor positions for {len(sensor_devices)} sensor devices (excluding moving objects)")
+        log_grid(f"🔍 Initializing sensor positions for {len(sensor_devices)} sensor devices (excluding moving objects)")
         
         for i, device in enumerate(sensor_devices):
             if i < len(default_positions):
@@ -330,7 +336,7 @@ class SimulationPage:
         
         # Only log when sensor count changes to prevent spam
         if len(devices) != self.last_sensor_count:
-            print(f"🔍 Displaying sensor nodes: {len(devices)} devices (excluding moving objects)")
+            log_grid(f"🔍 Displaying sensor nodes: {len(devices)} devices (excluding moving objects)")
             self.last_sensor_count = len(devices)
         
         for i, device in enumerate(devices):
@@ -605,12 +611,27 @@ class SimulationPage:
             if result:
                 self.moving_object_position = result['position']
                 
+                # Logging control for debugging triangle display
+                current_time = pygame.time.get_ticks()
+                should_log = not hasattr(self, '_last_display_log') or current_time - self._last_display_log > 2000
+                if should_log:
+                    self._last_display_log = current_time
+                
                 # Draw visualization layers
                 if self.show_circles:
                     self._draw_distance_circles(nodes, distances)
                 
                 if self.show_triangle and 'triangle' in result and result['triangle'] is not None:
+                    # Debug: Log triangle drawing attempt
+                    triangle = result['triangle']
+                    if should_log:
+                        area_check = self._triangle_area(triangle[0], triangle[1], triangle[2])
+                        log_trilateration(f"🎨 Drawing triangle with area: {area_check:.1f} cm²")
+                        log_trilateration(f"   • Vertices: ({triangle[0].x:.1f},{triangle[0].y:.1f}), ({triangle[1].x:.1f},{triangle[1].y:.1f}), ({triangle[2].x:.1f},{triangle[2].y:.1f})")
                     self._draw_triangle_of_interest(result['triangle'])
+                elif self.show_triangle:
+                    if should_log:
+                        log_trilateration(f"⚠️ Triangle display requested but data missing: triangle={result.get('triangle', 'None')}")
                 
                 # Draw estimated car with physical dimensions (includes orientation)
                 if 'car_dimensions' in result:
@@ -785,135 +806,187 @@ class SimulationPage:
     
     def _perform_trilateration(self, nodes: List[SensorNode], distances: List[float]) -> Optional[Dict]:
         """
-        ROBUST MINIMUM AREA TRIANGLE ALGORITHM:
-        Find the smallest valid triangle formed by points on the three distance circles.
+        STEP-BY-STEP MINIMUM AREA TRIANGLE ALGORITHM:
+        1. Get sensor positions and distances
+        2. Create distance circles 
+        3. Sample points on circle perimeters
+        4. Test all triangle combinations
+        5. Check geometric constraints (no vertices inside circles)
+        6. Find minimum area valid triangle
         """
         if len(nodes) < 3 or len(distances) < 3:
             return None
         
-        # Car physical dimensions (30cm x 16cm)
-        CAR_LENGTH = 30.0  # cm
-        CAR_WIDTH = 16.0   # cm  
-        CAR_RADIUS = math.sqrt((CAR_LENGTH/2)**2 + (CAR_WIDTH/2)**2)  # ~17.9cm diagonal
+        # Car physical dimensions
+        CAR_LENGTH = 30.0
+        CAR_WIDTH = 16.0  
+        CAR_RADIUS = math.sqrt((CAR_LENGTH/2)**2 + (CAR_WIDTH/2)**2)
         
-        # Use the first 3 nodes
+        # STEP 1: Get sensor positions and distances
         p1, p2, p3 = nodes[:3]
         r1, r2, r3 = distances[:3]
         
-        # Only log once per second to avoid spam
+        # Logging control
         current_time = pygame.time.get_ticks()
         should_log = not hasattr(self, '_last_trilateration_log') or current_time - self._last_trilateration_log > 2000
         if should_log:
             self._last_trilateration_log = current_time
-            print(f"\n🔧 Trilateration Algorithm")
-            print(f"📍 Sensors: P1=({p1.position.x:.1f},{p1.position.y:.1f},r={r1:.1f}), " +
+            log_trilateration(f"\n🔧 STEP-BY-STEP Trilateration Algorithm")
+            log_trilateration(f"📍 STEP 1 - Sensors: P1=({p1.position.x:.1f},{p1.position.y:.1f},r={r1:.1f}), " +
                   f"P2=({p2.position.x:.1f},{p2.position.y:.1f},r={r2:.1f}), " +
                   f"P3=({p3.position.x:.1f},{p3.position.y:.1f},r={r3:.1f})")
         
-        # First try analytical circle intersections for robustness
-        intersection_candidates = []
+        # STEP 2: Check if circles can form valid triangles (geometric feasibility)
+        d12 = p1.position.distance_to(p2.position)
+        d13 = p1.position.distance_to(p3.position)
+        d23 = p2.position.distance_to(p3.position)
         
-        # Find all pairwise circle intersections
+        if should_log:
+            log_trilateration(f"📍 STEP 2 - Circle distances: d12={d12:.1f}, d13={d13:.1f}, d23={d23:.1f}")
+            log_trilateration(f"         - Circle overlaps: P1-P2={abs(r1-r2) <= d12 <= r1+r2}, " +
+                             f"P1-P3={abs(r1-r3) <= d13 <= r1+r3}, P2-P3={abs(r2-r3) <= d23 <= r2+r3}")
+        
+        # First try analytical circle intersections for perfect cases
+        intersection_candidates = []
         int_12 = self._circle_intersections(p1.position, r1, p2.position, r2)
         int_13 = self._circle_intersections(p1.position, r1, p3.position, r3)
         int_23 = self._circle_intersections(p2.position, r2, p3.position, r3)
         
-        # Collect all intersection points and calculate their error relative to all three circles
         all_intersections = []
-        if int_12:
-            all_intersections.extend(int_12)
-        if int_13:
-            all_intersections.extend(int_13)
-        if int_23:
-            all_intersections.extend(int_23)
+        if int_12: all_intersections.extend(int_12)
+        if int_13: all_intersections.extend(int_13)
+        if int_23: all_intersections.extend(int_23)
         
         if all_intersections:
             for point in all_intersections:
-                # Calculate total error for this point relative to all three circles
                 error1 = abs(point.distance_to(p1.position) - r1)
                 error2 = abs(point.distance_to(p2.position) - r2)
                 error3 = abs(point.distance_to(p3.position) - r3)
                 total_error = error1 + error2 + error3
                 intersection_candidates.append((point, total_error))
             
-            # Sort by total error
             intersection_candidates.sort(key=lambda x: x[1])
             
-            # If the best intersection point has low error, use it
-            if intersection_candidates[0][1] < 5.0:  # 5cm total error threshold
+            if intersection_candidates and intersection_candidates[0][1] < 5.0:
                 best_point = intersection_candidates[0][0]
                 if should_log:
-                    print(f"✅ Using analytical intersection with error: {intersection_candidates[0][1]:.1f}cm")
-                    print(f"🚗 Car position: ({best_point.x:.1f}, {best_point.y:.1f})")
+                    log_trilateration(f"✅ Using analytical intersection with error: {intersection_candidates[0][1]:.1f}cm")
+                    log_position(f"🚗 Car position: ({best_point.x:.1f}, {best_point.y:.1f})")
                 
                 return {
                     'position': best_point,
-                    'triangle': None,  # No triangle visualization for analytical solution
+                    'triangle': None,
                     'car_dimensions': {'length': CAR_LENGTH, 'width': CAR_WIDTH, 'radius': CAR_RADIUS}
                 }
         
-        # If analytical approach fails, use minimum area triangle approach
-        # Sample fewer points for efficiency but ensure good coverage
-        samples_per_circle = 24
-        circle1_points = self._sample_circle_points(p1.position, r1, samples_per_circle)
-        circle2_points = self._sample_circle_points(p2.position, r2, samples_per_circle)  
-        circle3_points = self._sample_circle_points(p3.position, r3, samples_per_circle)
+        # STEP 3: Sample points on circle perimeters with proper formula
+        samples_per_circle = 72
+        if should_log:
+            log_trilateration(f"📍 STEP 3 - Sampling {samples_per_circle} points per circle perimeter")
         
+        circle1_points = self._sample_circle_points_precise(p1.position, r1, samples_per_circle)
+        circle2_points = self._sample_circle_points_precise(p2.position, r2, samples_per_circle)  
+        circle3_points = self._sample_circle_points_precise(p3.position, r3, samples_per_circle)
+        
+        if should_log:
+            log_trilateration(f"         - Circle 1: {len(circle1_points)} points, sample: ({circle1_points[0].x:.1f},{circle1_points[0].y:.1f})")
+            log_trilateration(f"         - Circle 2: {len(circle2_points)} points, sample: ({circle2_points[0].x:.1f},{circle2_points[0].y:.1f})")
+            log_trilateration(f"         - Circle 3: {len(circle3_points)} points, sample: ({circle3_points[0].x:.1f},{circle3_points[0].y:.1f})")
+        
+        # STEP 4: Test all triangle combinations with strict validation
         best_triangle = None
         min_area = float('inf')
         best_centroid = None
         valid_count = 0
+        total_tested = 0
         
-        # More reasonable minimum area threshold
-        MIN_TRIANGLE_AREA = 100.0  # cm² - larger minimum to avoid degenerate triangles
-        MIN_SIDE_LENGTH = 15.0     # cm - minimum distance between any two points
+        # Algorithm constraints
+        MIN_TRIANGLE_AREA = 100.0
+        MIN_SIDE_LENGTH = 15.0
+        PERIMETER_TOLERANCE = 0.5  # Slightly relaxed for numerical stability
         
-        # Smart sampling: don't check every combination, sample strategically
-        sample_step = max(1, samples_per_circle // 8)  # Check every 8th point for efficiency
+        if should_log:
+            log_trilateration(f"� STEP 4 - Testing triangle combinations")
+            log_trilateration(f"         - Min area: {MIN_TRIANGLE_AREA} cm², Min side: {MIN_SIDE_LENGTH} cm")
+            log_trilateration(f"         - Perimeter tolerance: {PERIMETER_TOLERANCE} cm")
         
-        for i in range(0, samples_per_circle, sample_step):
-            pt1 = circle1_points[i]
-            for j in range(0, samples_per_circle, sample_step):
-                pt2 = circle2_points[j]
-                
-                # Quick distance check
-                if pt1.distance_to(pt2) < MIN_SIDE_LENGTH:
-                    continue
+        # STEP 5: Check each triangle combination
+        for i, pt1 in enumerate(circle1_points):
+            for j, pt2 in enumerate(circle2_points):
+                for k, pt3 in enumerate(circle3_points):
+                    total_tested += 1
                     
-                for k in range(0, samples_per_circle, sample_step):
-                    pt3 = circle3_points[k]
-                    
-                    # Check minimum distances between all points
+                    # Check minimum side lengths
                     d12 = pt1.distance_to(pt2)
                     d23 = pt2.distance_to(pt3)
                     d13 = pt1.distance_to(pt3)
                     
-                    if d23 < MIN_SIDE_LENGTH or d13 < MIN_SIDE_LENGTH:
+                    if d12 < MIN_SIDE_LENGTH or d23 < MIN_SIDE_LENGTH or d13 < MIN_SIDE_LENGTH:
+                        continue
+                    
+                    # Verify points are exactly on their respective circle perimeters
+                    dist1_error = abs(pt1.distance_to(p1.position) - r1)
+                    dist2_error = abs(pt2.distance_to(p2.position) - r2)
+                    dist3_error = abs(pt3.distance_to(p3.position) - r3)
+                    
+                    if (dist1_error > PERIMETER_TOLERANCE or 
+                        dist2_error > PERIMETER_TOLERANCE or 
+                        dist3_error > PERIMETER_TOLERANCE):
                         continue
                     
                     # Calculate triangle area
-                    area = self._triangle_area(pt1, pt2, pt3)
-                    
-                    # Skip degenerate triangles
+                    area = self._triangle_area_precise(pt1, pt2, pt3)
                     if area < MIN_TRIANGLE_AREA:
+                        continue
+                    
+                    # STEP 6: Critical constraint - no vertices inside any circle
+                    is_valid_triangle = self._validate_triangle_exterior(pt1, pt2, pt3, 
+                                                                        [(p1.position, r1), (p2.position, r2), (p3.position, r3)],
+                                                                        PERIMETER_TOLERANCE)
+                    
+                    if not is_valid_triangle:
+                        continue
+                    
+                    # Calculate triangle centroid
+                    centroid = Point2D(
+                        (pt1.x + pt2.x + pt3.x) / 3,
+                        (pt1.y + pt2.y + pt3.y) / 3
+                    )
+                    
+                    # Additional feasibility check - centroid shouldn't be too close to circles
+                    dist_c1 = centroid.distance_to(p1.position)
+                    dist_c2 = centroid.distance_to(p2.position)
+                    dist_c3 = centroid.distance_to(p3.position)
+                    
+                    if (dist_c1 < r1 - 10 or dist_c2 < r2 - 10 or dist_c3 < r3 - 10):
                         continue
                     
                     valid_count += 1
                     
-                    # Update best triangle if this one has smaller area
+                    # Update best triangle if smaller area
                     if area < min_area:
                         min_area = area
                         best_triangle = [pt1, pt2, pt3]
-                        # Calculate centroid
-                        best_centroid = Point2D(
-                            (pt1.x + pt2.x + pt3.x) / 3,
-                            (pt1.y + pt2.y + pt3.y) / 3
-                        )
+                        best_centroid = centroid
         
+        if should_log:
+            log_trilateration(f"📍 STEP 5 - Tested {total_tested} combinations, found {valid_count} valid triangles")
+        
+        # STEP 7: Return result or fallback
         if best_triangle and best_centroid:
             if should_log:
-                print(f"✅ Found minimum area triangle (area: {min_area:.1f} cm², {valid_count} valid triangles)")
-                print(f"🚗 Car position: ({best_centroid.x:.1f}, {best_centroid.y:.1f})")
+                log_trilateration(f"✅ STEP 6 - Found minimum area triangle:")
+                log_trilateration(f"         - Area: {min_area:.1f} cm²")
+                log_trilateration(f"         - Vertices: ({best_triangle[0].x:.1f},{best_triangle[0].y:.1f}), " +
+                                 f"({best_triangle[1].x:.1f},{best_triangle[1].y:.1f}), ({best_triangle[2].x:.1f},{best_triangle[2].y:.1f})")
+                log_trilateration(f"         - Centroid: ({best_centroid.x:.1f},{best_centroid.y:.1f})")
+                log_position(f"🚗 Car position: ({best_centroid.x:.1f}, {best_centroid.y:.1f})")
+                
+                # Verification
+                p1_dist = best_triangle[0].distance_to(p1.position)
+                p2_dist = best_triangle[1].distance_to(p2.position)
+                p3_dist = best_triangle[2].distance_to(p3.position)
+                log_trilateration(f"         - Verification - P1: {abs(p1_dist - r1):.3f}cm, P2: {abs(p2_dist - r2):.3f}cm, P3: {abs(p3_dist - r3):.3f}cm")
             
             return {
                 'position': best_centroid,
@@ -921,18 +994,16 @@ class SimulationPage:
                 'car_dimensions': {'length': CAR_LENGTH, 'width': CAR_WIDTH, 'radius': CAR_RADIUS}
             }
         
-        # Final fallback: weighted centroid
+        # STEP 8: Fallback if no valid triangles found
         if should_log:
-            print(f"⚠️ No valid triangles found, using fallback")
+            log_trilateration(f"⚠️ STEP 7 - No valid triangles found, using weighted fallback")
         
-        # Simple weighted position based on inverse distance
         total_weight = 0
         weighted_x = 0
         weighted_y = 0
         
-        for i, (pos, radius) in enumerate([(p1.position, r1), (p2.position, r2), (p3.position, r3)]):
-            # Weight inversely proportional to distance (closer sensors have more influence)
-            weight = 1.0 / max(radius, 1.0)  # Avoid division by zero
+        for pos, radius in [(p1.position, r1), (p2.position, r2), (p3.position, r3)]:
+            weight = 1.0 / max(radius, 1.0)
             total_weight += weight
             weighted_x += pos.x * weight
             weighted_y += pos.y * weight
@@ -940,7 +1011,7 @@ class SimulationPage:
         fallback_position = Point2D(weighted_x / total_weight, weighted_y / total_weight)
         
         if should_log:
-            print(f"📍 Fallback position: ({fallback_position.x:.1f}, {fallback_position.y:.1f})")
+            log_position(f"📍 Fallback position: ({fallback_position.x:.1f}, {fallback_position.y:.1f})")
         
         return {
             'position': fallback_position,
@@ -950,10 +1021,11 @@ class SimulationPage:
         }
     
     def _sample_circle_points(self, center: Point2D, radius: float, num_samples: int = 24) -> List[Point2D]:
-        """Sample points uniformly around a circle"""
+        """Sample points uniformly around a circle perimeter with high precision"""
         points = []
         for i in range(num_samples):
             angle = (2 * math.pi * i) / num_samples
+            # Ensure points are exactly on the circle perimeter
             x = center.x + radius * math.cos(angle)
             y = center.y + radius * math.sin(angle)
             points.append(Point2D(x, y))
@@ -996,8 +1068,95 @@ class SimulationPage:
         return [p1, p2]
     
     def _triangle_area(self, p1: Point2D, p2: Point2D, p3: Point2D) -> float:
-        """Calculate area of a triangle using cross product"""
-        return abs((p2.x - p1.x) * (p3.y - p1.y) - (p3.x - p1.x) * (p2.y - p1.y)) / 2
+        """Calculate triangle area using cross product"""
+        area = abs((p2.x - p1.x) * (p3.y - p1.y) - (p3.x - p1.x) * (p2.y - p1.y)) / 2.0
+        return area
+    
+    def _triangle_edges_exterior_to_circles(self, p1: Point2D, p2: Point2D, p3: Point2D, 
+                                           c1: Point2D, r1: float, c2: Point2D, r2: float, c3: Point2D, r3: float,
+                                           tolerance: float) -> bool:
+        """
+        CRITICAL GEOMETRIC CONSTRAINT VALIDATION:
+        Ensure that triangle edges remain EXTERIOR to all distance circles.
+        This prevents the triangle from intersecting or entering the circles.
+        
+        Args:
+            p1, p2, p3: Triangle vertices (should be on circle perimeters)
+            c1, c2, c3: Circle centers
+            r1, r2, r3: Circle radii
+            tolerance: Distance tolerance for edge-circle separation
+            
+        Returns:
+            True if all triangle edges are exterior to all circles (valid triangle)
+            False if any edge intersects or enters any circle (invalid triangle)
+        """
+        
+        # Define triangle edges
+        edges = [
+            (p1, p2),  # Edge between circles 1 and 2
+            (p2, p3),  # Edge between circles 2 and 3  
+            (p3, p1),  # Edge between circles 3 and 1
+        ]
+        
+        circles = [
+            (c1, r1),
+            (c2, r2), 
+            (c3, r3)
+        ]
+        
+        # Check each edge against each circle
+        for edge_idx, (start, end) in enumerate(edges):
+            for circle_idx, (center, radius) in enumerate(circles):
+                
+                # Skip checking an edge against the circles it connects to
+                # (the endpoints are supposed to be on those circle perimeters)
+                if edge_idx == 0 and (circle_idx == 0 or circle_idx == 1):  # Edge p1-p2 connects circles 1&2
+                    continue
+                elif edge_idx == 1 and (circle_idx == 1 or circle_idx == 2):  # Edge p2-p3 connects circles 2&3
+                    continue
+                elif edge_idx == 2 and (circle_idx == 2 or circle_idx == 0):  # Edge p3-p1 connects circles 3&1
+                    continue
+                
+                # Check if this edge intersects with this circle
+                min_distance = self._distance_from_point_to_line_segment(center, start, end)
+                
+                # The edge must maintain minimum distance from circle perimeter
+                if min_distance < radius + tolerance:
+                    return False  # Edge too close to or intersecting circle
+        
+        return True  # All edges are properly exterior to circles
+    
+    def _distance_from_point_to_line_segment(self, point: Point2D, line_start: Point2D, line_end: Point2D) -> float:
+        """
+        Calculate the minimum distance from a point to a line segment.
+        This is used to check if triangle edges intersect circles.
+        """
+        # Vector from line_start to line_end
+        line_vec = Point2D(line_end.x - line_start.x, line_end.y - line_start.y)
+        
+        # Vector from line_start to point
+        point_vec = Point2D(point.x - line_start.x, point.y - line_start.y)
+        
+        # Length squared of the line segment
+        line_len_sq = line_vec.x * line_vec.x + line_vec.y * line_vec.y
+        
+        if line_len_sq == 0:
+            # Line segment is actually a point
+            return point.distance_to(line_start)
+        
+        # Parameter t represents the projection of point onto the line
+        # t = 0 means projection is at line_start
+        # t = 1 means projection is at line_end
+        t = max(0, min(1, (point_vec.x * line_vec.x + point_vec.y * line_vec.y) / line_len_sq))
+        
+        # Find the closest point on the line segment
+        closest_point = Point2D(
+            line_start.x + t * line_vec.x,
+            line_start.y + t * line_vec.y
+        )
+        
+        # Return distance from point to closest point on line segment
+        return point.distance_to(closest_point)
     
     def _draw_triangle_of_interest(self, triangle: List[Point2D]):
         """Draw the minimum area triangle"""
@@ -1345,7 +1504,7 @@ class SimulationPage:
                             self.demo_moving_object['position'] = Point2D(self.grid_range_x / 2, self.grid_range_y / 2)
                         
                         self.demo_moving_object['orientation'] = 0.0  # Up direction (0° = north/up)
-                        print(f"Demo started at position: ({self.demo_moving_object['position'].x:.1f}, {self.demo_moving_object['position'].y:.1f})")
+                        log_demo(f"Demo started at position: ({self.demo_moving_object['position'].x:.1f}, {self.demo_moving_object['position'].y:.1f})")
                     return
                 
                 # Toggle distance mode button
@@ -1367,7 +1526,7 @@ class SimulationPage:
                                         self.demo_moving_object['manual_distances'][device_id] = 100.0
                         else:
                             self.demo_moving_object['distance_mode'] = 'auto'
-                        print(f"Distance mode switched to: {self.demo_moving_object['distance_mode']}")
+                        log_demo(f"Distance mode switched to: {self.demo_moving_object['distance_mode']}")
                     return
                 
                 # Individual sensor distance adjustment buttons (only for sensor devices)
