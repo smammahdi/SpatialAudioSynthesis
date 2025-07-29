@@ -175,7 +175,9 @@ class UIManager:
         """Handle device disconnection with friendly logging"""
         # Try to get device name before it's removed
         device = self.device_manager.devices.get(device_id)
-        device_name = device.device_name if device else device_id
+        demo_device = self.device_manager.demo_devices.get(device_id) if self.device_manager.demo_mode else None
+        device_name = (device.device_name if device else 
+                       demo_device.device_name if demo_device else device_id)
         
         # Clean up UI state
         if device_id in self.device_enabled_states:
@@ -185,6 +187,12 @@ class UIManager:
         # Keep device color for potential reconnection consistency
         # if device_id in self.device_colors:
         #     del self.device_colors[device_id]
+        
+        # Clean up UI button references
+        if hasattr(self, 'disconnect_button_rects'):
+            disconnect_btn_key = f"disconnect_{device_id}"
+            if disconnect_btn_key in self.disconnect_button_rects:
+                del self.disconnect_button_rects[disconnect_btn_key]
         
         # Clean up chart data
         if device_id in self.distance_data:
@@ -505,17 +513,38 @@ class UIManager:
                     # Extract device_id from button_key (format: "disconnect_{device_id}")
                     device_id = button_key.replace("disconnect_", "")
                     
-                    # Get device name for friendly logging
+                    # Get device name for friendly logging (check both regular and demo devices)
                     device = self.device_manager.devices.get(device_id)
-                    device_name = device.device_name if device else device_id
+                    demo_device = self.device_manager.demo_devices.get(device_id) if self.device_manager.demo_mode else None
+                    device_name = (device.device_name if device else 
+                                   demo_device.device_name if demo_device else device_id)
+                    
+                    # Ensure the device actually exists before attempting disconnect
+                    if not device and not demo_device:
+                        self.add_log_entry(f"Device {device_id} no longer exists", "warning")
+                        return
                     
                     self.add_log_entry(f"Disconnecting {device_name}...", "info")
                     
-                    # Check if this is a demo device and handle accordingly
-                    if self.device_manager.demo_mode and device_id in self.device_manager.demo_devices:
-                        self.device_manager.remove_demo_device(device_id)
-                    else:
-                        self.device_manager.disconnect_device(device_id)
+                    try:
+                        # Enhanced disconnect logic with better error handling
+                        if self.device_manager.demo_mode and device_id in self.device_manager.demo_devices:
+                            # Demo device disconnect
+                            success = self.device_manager.remove_demo_device(device_id)
+                            if success:
+                                self.add_log_entry(f"Demo device {device_name} disconnected", "success")
+                            else:
+                                self.add_log_entry(f"Failed to disconnect demo device {device_name}", "error")
+                        elif device_id in self.device_manager.devices:
+                            # Regular device disconnect
+                            self.device_manager.disconnect_device(device_id)
+                            self.add_log_entry(f"Device {device_name} disconnected", "success")
+                        else:
+                            self.add_log_entry(f"Device {device_name} not found in connected devices", "warning")
+                    except Exception as e:
+                        self.add_log_entry(f"Error disconnecting {device_name}: {str(e)}", "error")
+                        print(f"🚨 Disconnect error for {device_name}: {e}")
+                    
                     return
         
         # Device enable/disable checkboxes

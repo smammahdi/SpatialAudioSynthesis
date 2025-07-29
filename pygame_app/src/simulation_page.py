@@ -70,6 +70,7 @@ class SimulationPage:
         self.show_grid = True
         self.show_connections = False  # Show dotted lines between sensor centers
         self.show_tracing = True  # Show position trace
+        self.show_spatial_audio = True  # Show spatial audio ear positions and line-of-sight analysis
         
         # Dictionary for the checkboxes visualization settings
         self.visualization_settings = {
@@ -78,7 +79,8 @@ class SimulationPage:
             'show_triangle': self.show_triangle,
             'show_sprite': self.show_sprite,  # Changed from show_orientation
             'show_connections': self.show_connections,
-            'show_tracing': self.show_tracing
+            'show_tracing': self.show_tracing,
+            'show_spatial_audio': self.show_spatial_audio
         }
         
         # Position tracing for moving object
@@ -88,6 +90,12 @@ class SimulationPage:
         # Track previous manual distances to detect changes (for logging)
         self.previous_manual_distances = {}
         
+        # Track previous automatic distances to detect changes (for logging)
+        self.previous_auto_distances = {}
+        
+        # Track previous trilateration distances to prevent unnecessary recalculation
+        self.previous_trilateration_distances = {}
+        
         # Grid range settings
         # Fixed optimal grid range for spatial audio visualization (2m x 1.5m)
         self.grid_range_x = 200  # cm (2 meters)
@@ -95,6 +103,12 @@ class SimulationPage:
         
         # Track logging state to prevent spam
         self.last_sensor_count = -1
+        
+        # Logging throttle system - reduce excessive debug output
+        self.last_debug_log_time = 0
+        self.debug_log_interval = 2000  # Log debug info every 2 seconds max
+        self.last_triangle_validation_log = 0
+        self.triangle_validation_log_interval = 3000  # Log triangle validation every 3 seconds max
         
         # Moving object state
         self.moving_object_device = None
@@ -265,7 +279,7 @@ class SimulationPage:
         """Render visualization options section"""
         y_pos = y_start
         
-        section_height = 200  # Increased to accommodate 6 options
+        section_height = 220  # Increased to accommodate 7 options
         section_rect = pygame.Rect(rect.x + 5, y_pos, rect.width - 10, section_height)
         pygame.draw.rect(self.screen, (25, 30, 40), section_rect, border_radius=5)
         pygame.draw.rect(self.screen, self.colors['border'], section_rect, 1, border_radius=5)
@@ -281,7 +295,8 @@ class SimulationPage:
             ('show_triangle', 'Min Area Triangle', self.show_triangle),
             ('show_connections', 'Sensor Connections', self.show_connections),
             ('show_sprite', 'Car Sprite & Orientation', self.show_sprite),
-            ('show_tracing', 'Position Trace', self.show_tracing)
+            ('show_tracing', 'Position Trace', self.show_tracing),
+            ('show_spatial_audio', 'Spatial Audio Analysis', self.show_spatial_audio)
         ]
         
         for key, label, value in options:
@@ -508,6 +523,9 @@ class SimulationPage:
         if self.show_grid:
             self._draw_grid_lines(grid_rect)
         
+        # Always draw axis labels regardless of grid visibility
+        self._draw_axis_labels(grid_rect)
+        
         self._draw_sensor_nodes(grid_rect)
         
         if self.selected_node and self.mouse_pos[0] > self.left_width + 20:
@@ -552,11 +570,41 @@ class SimulationPage:
         if len(active_nodes) >= 3:
             nodes = active_nodes[:3]
             
-            # Perform trilateration to find moving object position
-            trilateration_result = self._perform_trilateration(nodes, distances)
+            # Check if distances have changed before performing trilateration
+            current_distances = {node.id: distances[i] for i, node in enumerate(nodes)}
+            distances_changed = current_distances != self.previous_trilateration_distances
+            
+            if distances_changed:
+                self.previous_trilateration_distances = current_distances.copy()
+                
+                # Perform trilateration to find moving object position
+                trilateration_result = self._perform_trilateration(nodes, distances)
+                
+                # Cache the result for future use
+                self._cached_trilateration_result = trilateration_result
+            else:
+                # Use cached result if distances haven't changed
+                trilateration_result = getattr(self, '_cached_trilateration_result', None)
             
             if trilateration_result:
                 self.moving_object_position = trilateration_result['position']
+                
+                # Perform spatial audio synthesis for all enabled devices
+                car_pos = (trilateration_result['position'].x, trilateration_result['position'].y)
+                car_orientation = self.demo_moving_object['orientation'] if self.demo_moving_object['enabled'] else self.moving_object_orientation
+                
+                # Get sensor positions and distances
+                sensor_positions = [(node.position.x, node.position.y) for node in nodes[:3]]  # First 3 sensors
+                sensor_distances = distances[:3]  # Corresponding distances
+                
+                # Synthesize spatial audio for enabled devices
+                for device_id in self.device_manager.devices:
+                    device = self.device_manager.devices[device_id]
+                    if hasattr(self, 'audio_engine') and self.audio_engine:
+                        self.audio_engine.synthesize_spatial_audio(
+                            device_id, car_pos, car_orientation, 
+                            sensor_positions, sensor_distances, volume=0.7
+                        )
                 
                 # Only update position trace when we have a valid triangle (not fallback)
                 if not trilateration_result.get('is_fallback', False):
@@ -579,16 +627,20 @@ class SimulationPage:
                     triangle_distances = trilateration_result.get('triangle_distances', distances)
                     self._draw_triangle_of_interest(trilateration_result['triangle'], triangle_distances)
                 
-                # Draw the estimated car position
-                self._draw_estimated_car(
-                    trilateration_result['position'], 
-                    trilateration_result['car_dimensions'],
-                    trilateration_result.get('is_fallback', False)
-                )
-                
-                # Draw sprite with orientation if enabled
+                # Draw car - either sprite with orientation or basic estimated car, not both
                 if self.show_sprite:
                     self._draw_car_sprite_with_orientation(trilateration_result['position'])
+                else:
+                    self._draw_estimated_car(
+                        trilateration_result['position'], 
+                        trilateration_result['car_dimensions'],
+                        trilateration_result.get('is_fallback', False)
+                    )
+                
+                # Draw spatial audio analysis if enabled
+                if self.show_spatial_audio:
+                    current_orientation = self.demo_moving_object['orientation'] if self.demo_moving_object['enabled'] else self.moving_object_orientation
+                    self._draw_spatial_audio_analysis(trilateration_result['position'], current_orientation)
                 
                 # Show "OUT OF RANGE" message if fallback is used
                 if trilateration_result.get('is_fallback', False):
@@ -667,6 +719,21 @@ class SimulationPage:
                                     self.grid_range_x * self.pixels_per_cm_x, 
                                     self.grid_range_y * self.pixels_per_cm_y)
         pygame.draw.rect(self.screen, self.colors['border'], boundary_rect, 3)
+
+    def _draw_axis_labels(self, rect: pygame.Rect):
+        """Draw axis labels for the grid"""
+        # Calculate boundary rectangle
+        max_y = self.grid_origin.y - self.grid_range_y * self.pixels_per_cm_y
+        boundary_rect = pygame.Rect(self.grid_origin.x, max_y, 
+                                    self.grid_range_x * self.pixels_per_cm_x, 
+                                    self.grid_range_y * self.pixels_per_cm_y)
+        
+        # Debug: Log axis label drawing (throttled)
+        current_time = pygame.time.get_ticks()
+        if not hasattr(self, '_last_axis_debug') or current_time - self._last_axis_debug > 5000:
+            self._last_axis_debug = current_time
+            # print(f"🔍 Drawing axis labels - X: ({boundary_rect.centerx}, {boundary_rect.bottom + 10}), Y: ({boundary_rect.left - 40}, {boundary_rect.centery})")
+        
         
         # Add corner labels for better reference
         # Top-right corner
@@ -690,7 +757,7 @@ class SimulationPage:
         x_label = "X-axis (cm)"
         x_label_rect = self.fonts['small'].get_rect(x_label)
         x_label_x = boundary_rect.centerx - x_label_rect.width // 2
-        x_label_y = boundary_rect.bottom + 25
+        x_label_y = boundary_rect.bottom + 5  # Position just below grid
         self.fonts['small'].render_to(self.screen, (x_label_x, x_label_y), 
                                      x_label, self.colors['text_secondary'])
         
@@ -699,9 +766,191 @@ class SimulationPage:
         y_label_surface = pygame.Surface(self.fonts['small'].get_rect(y_label).size, pygame.SRCALPHA)
         self.fonts['small'].render_to(y_label_surface, (0, 0), y_label, self.colors['text_secondary'])
         rotated_y_label = pygame.transform.rotate(y_label_surface, 90)
-        y_label_x = boundary_rect.left - 45
+        y_label_x = boundary_rect.left - 35  # Position to the left of grid
         y_label_y = boundary_rect.centery - rotated_y_label.get_height() // 2
         self.screen.blit(rotated_y_label, (y_label_x, y_label_y))
+    
+    def _calculate_ear_positions(self, car_center: Point2D, orientation: float) -> Dict:
+        """Calculate left and right ear positions based on car center and orientation"""
+        import math
+        
+        # Car dimensions (same as used elsewhere)
+        car_length = 30.0  # cm
+        car_width = 16.0   # cm
+        
+        # Ear positions are at the front center of the car, offset left and right
+        front_offset = car_length / 4  # 7.5cm forward from center (middle of front half)
+        ear_offset = car_width / 2     # 8cm to each side
+        
+        # Convert orientation to radians
+        angle_rad = math.radians(orientation)
+        cos_a = math.cos(angle_rad)
+        sin_a = math.sin(angle_rad)
+        
+        # Calculate front center position
+        front_center_x = car_center.x + front_offset * cos_a
+        front_center_y = car_center.y + front_offset * sin_a
+        
+        # Calculate left and right ear positions (perpendicular to orientation)
+        left_ear_x = front_center_x - ear_offset * sin_a
+        left_ear_y = front_center_y + ear_offset * cos_a
+        
+        right_ear_x = front_center_x + ear_offset * sin_a  
+        right_ear_y = front_center_y - ear_offset * cos_a
+        
+        return {
+            'left_ear': Point2D(left_ear_x, left_ear_y),
+            'right_ear': Point2D(right_ear_x, right_ear_y),
+            'front_center': Point2D(front_center_x, front_center_y)
+        }
+    
+    def _analyze_line_of_sight(self, ear_pos: Point2D, sensor_pos: Point2D, car_center: Point2D, orientation: float) -> str:
+        """Analyze if line-of-sight from ear to sensor is clear or muffled by car body"""
+        import math
+        
+        # Car dimensions
+        car_length = 30.0  # cm
+        car_width = 16.0   # cm
+        
+        # Create car body rectangle (oriented)
+        half_length = car_length / 2
+        half_width = car_width / 2
+        
+        # Car corners relative to center
+        corners = [
+            (-half_length, -half_width),
+            (half_length, -half_width),
+            (half_length, half_width),
+            (-half_length, half_width)
+        ]
+        
+        # Rotate corners based on orientation
+        angle_rad = math.radians(orientation)
+        cos_a = math.cos(angle_rad)
+        sin_a = math.sin(angle_rad)
+        
+        rotated_corners = []
+        for dx, dy in corners:
+            rotated_x = car_center.x + (dx * cos_a - dy * sin_a)
+            rotated_y = car_center.y + (dx * sin_a + dy * cos_a)
+            rotated_corners.append(Point2D(rotated_x, rotated_y))
+        
+        # Check if the line from ear to sensor intersects the car body rectangle
+        if self._line_intersects_rectangle(ear_pos, sensor_pos, rotated_corners):
+            return "MUFFLED"
+        else:
+            return "CLEAR"
+    
+    def _line_intersects_rectangle(self, p1: Point2D, p2: Point2D, rect_corners: List[Point2D]) -> bool:
+        """Check if line segment intersects with rectangle defined by corners"""
+        # Check intersection with each edge of the rectangle
+        for i in range(4):
+            corner1 = rect_corners[i]
+            corner2 = rect_corners[(i + 1) % 4]
+            
+            if self._line_segments_intersect(p1, p2, corner1, corner2):
+                return True
+        
+        return False
+    
+    def _line_segments_intersect(self, p1: Point2D, p2: Point2D, p3: Point2D, p4: Point2D) -> bool:
+        """Check if two line segments intersect using cross product method"""
+        def ccw(A, B, C):
+            return (C.y - A.y) * (B.x - A.x) > (B.y - A.y) * (C.x - A.x)
+        
+        return ccw(p1, p3, p4) != ccw(p2, p3, p4) and ccw(p1, p2, p3) != ccw(p1, p2, p4)
+    
+    def _draw_spatial_audio_analysis(self, car_center: Point2D, orientation: float):
+        """Draw spatial audio analysis visualization with ear positions and line-of-sight"""
+        if not car_center:
+            return
+        
+        # Get current orientation from demo or manual control
+        current_orientation = self.demo_moving_object['orientation'] if self.demo_moving_object['enabled'] else self.moving_object_orientation
+        
+        # Calculate ear positions
+        ear_positions = self._calculate_ear_positions(car_center, current_orientation)
+        left_ear = ear_positions['left_ear']
+        right_ear = ear_positions['right_ear']
+        
+        # Convert positions to screen coordinates
+        left_ear_screen_x = self.grid_origin.x + left_ear.x * self.pixels_per_cm_x
+        left_ear_screen_y = self.grid_origin.y - left_ear.y * self.pixels_per_cm_y
+        right_ear_screen_x = self.grid_origin.x + right_ear.x * self.pixels_per_cm_x
+        right_ear_screen_y = self.grid_origin.y - right_ear.y * self.pixels_per_cm_y
+        
+        # Draw ear positions as yellow squares (like in your image)
+        ear_size = 12
+        left_ear_rect = pygame.Rect(left_ear_screen_x - ear_size//2, left_ear_screen_y - ear_size//2, ear_size, ear_size)
+        right_ear_rect = pygame.Rect(right_ear_screen_x - ear_size//2, right_ear_screen_y - ear_size//2, ear_size, ear_size)
+        
+        pygame.draw.rect(self.screen, (255, 255, 0), left_ear_rect)  # Yellow
+        pygame.draw.rect(self.screen, (255, 255, 0), right_ear_rect)  # Yellow
+        pygame.draw.rect(self.screen, (200, 200, 0), left_ear_rect, 2)  # Darker yellow border
+        pygame.draw.rect(self.screen, (200, 200, 0), right_ear_rect, 2)  # Darker yellow border
+        
+        # Get sensor nodes for line-of-sight analysis
+        sensor_devices = [device for device in self.device_manager.devices.values() 
+                          if device.device_type != "moving_object"]
+        
+        for device in sensor_devices:
+            if device.device_name in self.sensor_nodes:
+                sensor_node = self.sensor_nodes[device.device_name]
+                sensor_pos = sensor_node.position
+                
+                # Convert sensor position to screen coordinates
+                sensor_screen_x = self.grid_origin.x + sensor_pos.x * self.pixels_per_cm_x
+                sensor_screen_y = self.grid_origin.y - sensor_pos.y * self.pixels_per_cm_y
+                
+                # Analyze line-of-sight for both ears
+                left_status = self._analyze_line_of_sight(left_ear, sensor_pos, car_center, current_orientation)
+                right_status = self._analyze_line_of_sight(right_ear, sensor_pos, car_center, current_orientation)
+                
+                # Draw lines and labels for left ear
+                line_color = (0, 255, 0) if left_status == "CLEAR" else (255, 100, 100)  # Green for clear, red for muffled
+                pygame.draw.line(self.screen, line_color, 
+                               (int(left_ear_screen_x), int(left_ear_screen_y)),
+                               (int(sensor_screen_x), int(sensor_screen_y)), 2)
+                
+                # Draw line-of-sight label for left ear
+                mid_x = (left_ear_screen_x + sensor_screen_x) / 2
+                mid_y = (left_ear_screen_y + sensor_screen_y) / 2
+                label_text = f"L:{left_status}"
+                text_color = (0, 255, 0) if left_status == "CLEAR" else (255, 100, 100)
+                
+                # Create background for label
+                label_rect = self.fonts['small'].get_rect(label_text)
+                bg_rect = pygame.Rect(int(mid_x - label_rect.width//2 - 2), 
+                                    int(mid_y - label_rect.height//2 - 1), 
+                                    label_rect.width + 4, label_rect.height + 2)
+                pygame.draw.rect(self.screen, (0, 0, 0, 200), bg_rect)
+                
+                self.fonts['small'].render_to(self.screen, 
+                                            (int(mid_x - label_rect.width//2), int(mid_y - label_rect.height//2)), 
+                                            label_text, text_color)
+                
+                # Draw lines and labels for right ear  
+                line_color = (0, 255, 0) if right_status == "CLEAR" else (255, 100, 100)
+                pygame.draw.line(self.screen, line_color,
+                               (int(right_ear_screen_x), int(right_ear_screen_y)),
+                               (int(sensor_screen_x), int(sensor_screen_y)), 2)
+                
+                # Draw line-of-sight label for right ear (offset to avoid overlap)
+                mid_x = (right_ear_screen_x + sensor_screen_x) / 2
+                mid_y = (right_ear_screen_y + sensor_screen_y) / 2 + 15  # Offset down
+                label_text = f"R:{right_status}"
+                text_color = (0, 255, 0) if right_status == "CLEAR" else (255, 100, 100)
+                
+                # Create background for label
+                label_rect = self.fonts['small'].get_rect(label_text)
+                bg_rect = pygame.Rect(int(mid_x - label_rect.width//2 - 2), 
+                                    int(mid_y - label_rect.height//2 - 1), 
+                                    label_rect.width + 4, label_rect.height + 2)
+                pygame.draw.rect(self.screen, (0, 0, 0, 200), bg_rect)
+                
+                self.fonts['small'].render_to(self.screen, 
+                                            (int(mid_x - label_rect.width//2), int(mid_y - label_rect.height//2)), 
+                                            label_text, text_color)
     
     def _update_position_trace(self, position: Point2D):
         """Update the position trace with the new position"""
@@ -1047,333 +1296,211 @@ class SimulationPage:
 
     def _get_relevant_arc_points(self, center: Point2D, radius: float, other_center1: Point2D, other_center2: Point2D, num_samples: int) -> List[Point2D]:
         """
-        HIGHLY OPTIMIZED: Only samples points on the arc segment that faces TOWARD 
-        the region between the other two sensors. This creates a much more focused
-        search space and eliminates most degenerate triangles.
-        
-        CRITICAL FIX: Ensures all generated points are EXACTLY on the circle perimeter.
+        CORRECTED: Sample arc points that face toward the region where valid triangles exist.
+        This should be the arc facing toward the centroid of the three sensor positions.
         """
+        import math
+        
         if num_samples == 0 or radius <= 0:
             return []
-
-        # Calculate angles from this circle's center to the other two sensor centers
-        angle1 = math.atan2(other_center1.y - center.y, other_center1.x - center.x)
-        angle2 = math.atan2(other_center2.y - center.y, other_center2.x - center.x)
-
-        # Find the SHORTER arc between the two angles (more focused sampling)
-        start_angle = min(angle1, angle2)
-        end_angle = max(angle1, angle2)
-
-        # Handle wraparound case and choose the SHORTER arc
-        if end_angle - start_angle > math.pi:
-            # The shorter arc goes the other way around
-            start_angle, end_angle = end_angle, start_angle + 2 * math.pi
-
-        # Calculate the focused arc span
-        angle_span = end_angle - start_angle
         
-        # Further reduce the arc to focus on the CENTRAL portion (middle 60%)
-        arc_reduction_factor = 0.6  # Only sample middle 60% of the arc
-        center_angle = start_angle + angle_span / 2.0
-        reduced_span = angle_span * arc_reduction_factor
+        # Calculate the centroid of the three sensor positions
+        sensor_centroid_x = (center.x + other_center1.x + other_center2.x) / 3
+        sensor_centroid_y = (center.y + other_center1.y + other_center2.y) / 3
+        sensor_centroid = Point2D(sensor_centroid_x, sensor_centroid_y)
         
-        focused_start = center_angle - reduced_span / 2.0
-        focused_end = center_angle + reduced_span / 2.0
+        # Find the angle from this circle center toward the sensor centroid
+        centroid_angle = math.atan2(sensor_centroid.y - center.y, sensor_centroid.x - center.x)
         
-        # Safety check for degenerate cases
-        if reduced_span < 1e-3 or num_samples <= 1:
-            # Return single point at arc center - ENSURE EXACT RADIUS
-            x = center.x + radius * math.cos(center_angle)
-            y = center.y + radius * math.sin(center_angle)
-            point = Point2D(x, y)
-            
-            # VERIFICATION: Confirm point is exactly on perimeter
-            actual_distance = point.distance_to(center)
-            if abs(actual_distance - radius) > 1e-5:
-                log_trilateration(f"❌ CRITICAL: Generated point distance error: {abs(actual_distance - radius):.8f}")
-            
-            return [point]
-
-        # Generate points only along the highly focused arc with EXACT radius placement
+        # Sample an arc segment centered on this angle
+        # Arc span should be roughly 120 degrees (2π/3 radians) to ensure coverage
+        arc_span = math.pi * 2/3  # 120 degrees
+        start_angle = centroid_angle - arc_span/2
+        end_angle = centroid_angle + arc_span/2
+        
+        # Generate points along the arc segment facing toward sensor centroid
         points = []
         for i in range(num_samples):
-            # FIXED: Use proper division to avoid off-by-one errors
             if num_samples == 1:
-                angle = focused_start
+                angle = centroid_angle  # Center of arc
             else:
-                angle = focused_start + (i / (num_samples - 1)) * reduced_span
+                # Sample evenly across the arc
+                t = i / (num_samples - 1)
+                angle = start_angle + t * arc_span
             
-            # CRITICAL: Generate point with EXACT radius
+            # Generate point with exact radius
             x = center.x + radius * math.cos(angle)
             y = center.y + radius * math.sin(angle)
             point = Point2D(x, y)
-            
-            # VERIFICATION: Confirm each point is exactly on the perimeter
-            actual_distance = point.distance_to(center)
-            if abs(actual_distance - radius) > 1e-5:
-                log_trilateration(f"❌ CRITICAL: Arc point {i} distance error: {abs(actual_distance - radius):.8f}")
-                log_trilateration(f"   Expected radius: {radius:.6f}, Actual: {actual_distance:.6f}")
-                log_trilateration(f"   Center: ({center.x:.3f}, {center.y:.3f}), Point: ({point.x:.3f}, {point.y:.3f})")
-                # Fix the point to be exactly on the perimeter
-                correction_factor = radius / actual_distance
-                old_point = point
-                point = Point2D(center.x + (point.x - center.x) * correction_factor,
-                               center.y + (point.y - center.y) * correction_factor)
-                log_trilateration(f"   Corrected: ({old_point.x:.3f}, {old_point.y:.3f}) → ({point.x:.3f}, {point.y:.3f})")
-                
-                # Verify correction worked
-                corrected_distance = point.distance_to(center)
-                log_trilateration(f"   Corrected distance: {corrected_distance:.6f}, Error now: {abs(corrected_distance - radius):.8f}")
-            
             points.append(point)
-            
+        
         return points
 
     def _perform_trilateration(self, nodes: List[SensorNode], distances: List[float]) -> Optional[Dict]:
         """
-        Performs trilateration using the minimum area triangle method with dynamic
-        sampling and robust validation.
+        Clean minimum area triangle trilateration with simplified validation
         """
         if len(nodes) < 3 or len(distances) < 3:
             return None
 
-        # --- Setup ---
+        # Setup
         p1_node, p2_node, p3_node = nodes[:3]
         r1, r2, r3 = distances[:3]
         c1, c2, c3 = p1_node.position, p2_node.position, p3_node.position
-        circles = [(c1, r1), (c2, r2), (c3, r3)]
 
-        # Logging control
+        # Logging control - only when distances change
         current_time = pygame.time.get_ticks()
         should_log = not hasattr(self, '_last_trilateration_log') or current_time - self._last_trilateration_log > 2000
         if should_log:
             self._last_trilateration_log = current_time
-            log_trilateration(f"\n🔧 Performing Trilateration...")
-            log_trilateration(f"📍 Sensors: P1=({c1.x:.1f},{c1.y:.1f},r={r1:.1f}), "
-                              f"P2=({c2.x:.1f},{c2.y:.1f},r={r2:.1f}), "
-                              f"P3=({c3.x:.1f},{c3.y:.1f},r={r3:.1f})")
+            log_trilateration(f"\n🔧 Clean Minimum Area Triangle Algorithm")
+            log_trilateration(f"📍 Distance circles: C1=({c1.x:.1f},{c1.y:.1f},r={r1:.1f}), "
+                              f"C2=({c2.x:.1f},{c2.y:.1f},r={r2:.1f}), C3=({c3.x:.1f},{c3.y:.1f},r={r3:.1f})")
 
-        # --- Step 1: Dynamic and Arc-based Sampling ---
-        num_samples1 = self._calculate_dynamic_samples(r1)
-        num_samples2 = self._calculate_dynamic_samples(r2)
-        num_samples3 = self._calculate_dynamic_samples(r3)
-
-        if should_log:
-            log_trilateration(f"🔍 Dynamic Arc Sampling: C1={num_samples1}, C2={num_samples2}, C3={num_samples3} points")
-
-        circle1_points = self._get_relevant_arc_points(c1, r1, c2, c3, num_samples1)
-        circle2_points = self._get_relevant_arc_points(c2, r2, c1, c3, num_samples2)
-        circle3_points = self._get_relevant_arc_points(c3, r3, c1, c2, num_samples3)
+        # Get relevant arc points for each circle
+        circle1_points = self._get_relevant_arc_points(c1, r1, c2, c3, 16)
+        circle2_points = self._get_relevant_arc_points(c2, r2, c1, c3, 16)
+        circle3_points = self._get_relevant_arc_points(c3, r3, c1, c2, 16)
         
         if not all([circle1_points, circle2_points, circle3_points]):
-             if should_log: log_trilateration("⚠️ One or more circles have zero radius or invalid arc, cannot sample points.")
-             pass # Fallback logic will handle this case
+            if should_log:
+                log_trilateration("❌ Failed to generate arc points - invalid circles")
+            return None
 
-        # --- Step 2: Find Minimum Area Triangle ---
+        if should_log:
+            log_trilateration(f"🔄 Generated {len(circle1_points)} + {len(circle2_points)} + {len(circle3_points)} arc points")
+            log_trilateration(f"🔄 Testing up to {len(circle1_points) * len(circle2_points) * len(circle3_points)} triangle combinations")
+            
+            # Calculate expected car radius for debugging  
+            import math
+            car_radius = math.sqrt((30.0/2)**2 + (16.0/2)**2)  # ≈ 18cm
+            log_trilateration(f"🚗 Car radius: {car_radius:.1f}cm (constraint: center + radius ≤ measured distance)")
+
+        # Find minimum area triangle
         best_triangle = None
         min_area = float('inf')
-        valid_candidates_tested = 0
-        
-        # DEBUG: Track all candidate triangles for analysis
-        candidate_triangles = []  # List of (triangle, area) tuples
-        
-        # DEBUG: Add counters for rejection reasons
-        perimeter_rejections = 0
-        side_length_rejections = 0
-        area_rejections = 0
-        exterior_rejections = 0
-        thinness_rejections = 0
-        total_tested = 0
-
-        # EXTREMELY STRICT THRESHOLDS to prevent degenerate triangles
-        # Special handling for equal-radius cases (more lenient)
-        radii_equal = abs(r1 - r2) < 1.0 and abs(r2 - r3) < 1.0 and abs(r1 - r3) < 1.0
-        
-        if radii_equal:
-            MIN_TRIANGLE_AREA = 0.0   # More lenient for equal radius cases
-            MIN_SIDE_LENGTH = 0.0     # Allow smaller triangles
-            PERIMETER_TOLERANCE = 10.0  # Much more tolerance for equal radius
-            if should_log:
-                log_trilateration(f"🔄 Equal-radius detected, using relaxed thresholds: AREA={MIN_TRIANGLE_AREA}, SIDE={MIN_SIDE_LENGTH}, TOLERANCE={PERIMETER_TOLERANCE}")
-        else:
-            MIN_TRIANGLE_AREA = 0.0  # Stricter for unequal radius
-            MIN_SIDE_LENGTH = 0.0    # Stricter for unequal radius
-            PERIMETER_TOLERANCE = 5.0  # More lenient tolerance for mixed radius
+        valid_triangles = 0
+        tested_triangles = 0
 
         for pt1 in circle1_points:
             for pt2 in circle2_points:
                 for pt3 in circle3_points:
-                    total_tested += 1
-                    triangle = (pt1, pt2, pt3)
+                    triangle = [pt1, pt2, pt3]
+                    tested_triangles += 1
                     
-                    # CRITICAL VERIFICATION: Ensure each vertex is exactly on its respective circle perimeter
-                    dist1_to_c1 = pt1.distance_to(c1)
-                    dist2_to_c2 = pt2.distance_to(c2)
-                    dist3_to_c3 = pt3.distance_to(c3)
+                    # USER'S CONSTRAINT: Triangle must not share any common area with distance circles
+                    if self._triangle_intersects_circles(triangle, [(c1, r1), (c2, r2), (c3, r3)]):
+                        continue  # Invalid - triangle intersects with distance circles
                     
-                    perimeter_error_1 = abs(dist1_to_c1 - r1)
-                    perimeter_error_2 = abs(dist2_to_c2 - r2) 
-                    perimeter_error_3 = abs(dist3_to_c3 - r3)
-                    
-                    # Verify all vertices are on their respective perimeters with 1e-5 tolerance
-                    if (perimeter_error_1 > 1e-5 or perimeter_error_2 > 1e-5 or perimeter_error_3 > 1e-5):
-                        perimeter_rejections += 1
-                        if should_log and perimeter_rejections <= 3:  # Only log first few errors
-                            log_trilateration(f"❌ PERIMETER ERROR: P1={perimeter_error_1:.8f}, P2={perimeter_error_2:.8f}, P3={perimeter_error_3:.8f}")
-                        continue
-                    
-                    side1 = pt1.distance_to(pt2)
-                    side2 = pt2.distance_to(pt3) 
-                    side3 = pt3.distance_to(pt1)
-                    
-                    if (side1 < MIN_SIDE_LENGTH or side2 < MIN_SIDE_LENGTH or side3 < MIN_SIDE_LENGTH):
-                        side_length_rejections += 1
-                        if should_log and side_length_rejections <= 3:  # Debug first few
-                            log_trilateration(f"❌ SIDE LENGTH: sides=({side1:.3f}, {side2:.3f}, {side3:.3f}) < {MIN_SIDE_LENGTH}")
-                        continue
-
+                    # Calculate area
                     area = self._triangle_area_precise(pt1, pt2, pt3)
-                    if area < MIN_TRIANGLE_AREA:
-                        area_rejections += 1
-                        if should_log and area_rejections <= 3:  # Debug first few
-                            log_trilateration(f"❌ AREA TOO SMALL: area={area:.3f} < {MIN_TRIANGLE_AREA}")
-                        continue
-
-                    # Additional validation: Check for degenerate triangles (too thin/elongated)
-                    # Calculate the "thinness ratio" - ratio of area to perimeter squared
-                    perimeter = side1 + side2 + side3
-                    thinness_ratio = (4 * math.sqrt(3) * area) / (perimeter * perimeter)
-                    
-                    # Reject triangles that are too thin (close to straight lines)
-                    MIN_THINNESS_RATIO = 0.05  # Triangles thinner than this are likely slivers
-                    if thinness_ratio < MIN_THINNESS_RATIO:
-                        area_rejections += 1
-                        if should_log and area_rejections <= 3:  # Debug first few
-                            log_trilateration(f"❌ TRIANGLE TOO THIN: thinness_ratio={thinness_ratio:.4f} < {MIN_THINNESS_RATIO}")
-                        continue
-
-                    # Exterior validation with more lenient tolerance for interior checks
-                    EXTERIOR_TOLERANCE = PERIMETER_TOLERANCE * 3.0  # Much more lenient
-                    if not self._validate_triangle_exterior(triangle, circles, EXTERIOR_TOLERANCE):
-                        exterior_rejections += 1
-                        if should_log and exterior_rejections <= 3:  # Debug first few
-                            log_trilateration(f"❌ EXTERIOR VALIDATION FAILED (tolerance={EXTERIOR_TOLERANCE:.1f})")
+                    if area < 1.0:  # Avoid degenerate triangles
                         continue
                     
-                    valid_candidates_tested += 1
-                    
-                    # DEBUG: Track this candidate triangle
-                    candidate_triangles.append((triangle, area))
-                    
+                    valid_triangles += 1
                     if area < min_area:
                         min_area = area
                         best_triangle = triangle
-                        
-                        # DEBUG: Log each new minimum area candidate
-                        if valid_candidates_tested <= 3:  # Always show first 3 candidates
-                            log_trilateration(f"🔍 NEW MIN AREA CANDIDATE #{valid_candidates_tested}:")
-                            log_trilateration(f"   Area: {area:.3f} cm²")
-                            log_trilateration(f"   P1: ({pt1.x:.3f}, {pt1.y:.3f}) [dist to S1: {dist1_to_c1:.3f}]")
-                            log_trilateration(f"   P2: ({pt2.x:.3f}, {pt2.y:.3f}) [dist to S2: {dist2_to_c2:.3f}]")
-                            log_trilateration(f"   P3: ({pt3.x:.3f}, {pt3.y:.3f}) [dist to S3: {dist3_to_c3:.3f}]")
 
-        # DEBUG: Final candidate analysis
-        if candidate_triangles:  # Always show if we have candidates
-            log_trilateration(f"\n📊 CANDIDATE TRIANGLE ANALYSIS:")
-            log_trilateration(f"   Total valid candidates found: {len(candidate_triangles)}")
-            
-            # Sort candidates by area to show the progression
-            sorted_candidates = sorted(candidate_triangles, key=lambda x: x[1])
-            
-            log_trilateration(f"   📈 AREA PROGRESSION (smallest to largest):")
-            for i, (triangle, area) in enumerate(sorted_candidates[:5]):  # Show first 5
-                pt1, pt2, pt3 = triangle
-                log_trilateration(f"      #{i+1}: Area={area:.3f} cm² - P1({pt1.x:.1f},{pt1.y:.1f}), P2({pt2.x:.1f},{pt2.y:.1f}), P3({pt3.x:.1f},{pt3.y:.1f})")
-            
-            if len(sorted_candidates) > 5:
-                log_trilateration(f"      ... and {len(sorted_candidates)-5} more candidates")
-            
-            # Verify the final selection
-            if best_triangle:
-                final_area = self._triangle_area_precise(best_triangle[0], best_triangle[1], best_triangle[2])
-                log_trilateration(f"   ✅ FINAL SELECTION:")
-                log_trilateration(f"      Area: {final_area:.3f} cm² (should be {min_area:.3f})")
-                log_trilateration(f"      Vertices: P1({best_triangle[0].x:.3f},{best_triangle[0].y:.3f}), P2({best_triangle[1].x:.3f},{best_triangle[1].y:.3f}), P3({best_triangle[2].x:.3f},{best_triangle[2].y:.3f})")
-                
-                # Double-check perimeter accuracy for final triangle
-                final_dist1 = best_triangle[0].distance_to(c1)
-                final_dist2 = best_triangle[1].distance_to(c2) 
-                final_dist3 = best_triangle[2].distance_to(c3)
-                log_trilateration(f"      Final perimeter check: P1→S1={final_dist1:.6f} (expected {r1:.6f}), P2→S2={final_dist2:.6f} (expected {r2:.6f}), P3→S3={final_dist3:.6f} (expected {r3:.6f})")
-        else:
-            # Show rejection statistics when no candidates found
-            log_trilateration(f"\n⚠️ REJECTION ANALYSIS (No valid candidates found):")
-            log_trilateration(f"   Total triangles tested: {total_tested}")
-            log_trilateration(f"   Perimeter rejections: {perimeter_rejections}")
-            log_trilateration(f"   Side length rejections: {side_length_rejections}")
-            log_trilateration(f"   Area rejections: {area_rejections}")  
-            log_trilateration(f"   Exterior validation rejections: {exterior_rejections}")
-            log_trilateration(f"   Thresholds: MIN_AREA={MIN_TRIANGLE_AREA}, MIN_SIDE={MIN_SIDE_LENGTH}")
-            
-            if total_tested == 0:
-                log_trilateration(f"   ⚠️ No triangle combinations generated - check arc sampling!")
-            elif perimeter_rejections == total_tested:
-                log_trilateration(f"   ⚠️ All triangles rejected for perimeter errors - arc sampling issue!")
-            elif side_length_rejections > total_tested * 0.8:
-                log_trilateration(f"   ⚠️ Most triangles too small - consider reducing MIN_SIDE_LENGTH")
-            elif area_rejections > total_tested * 0.8:
-                log_trilateration(f"   ⚠️ Most triangles too small area - consider reducing MIN_TRIANGLE_AREA")
-
-        # --- Step 3: Process Result or Fallback ---
-        if best_triangle:
-            centroid = Point2D(
-                (best_triangle[0].x + best_triangle[1].x + best_triangle[2].x) / 3.0,
-                (best_triangle[0].y + best_triangle[1].y + best_triangle[2].y) / 3.0
-            )
+        if best_triangle is None:
             if should_log:
-                log_trilateration(f"✅ Found valid minimum area triangle:")
-                log_trilateration(f"   • Area: {min_area:.1f} cm², Valid candidates: {valid_candidates_tested}")
-                log_position(f"🚗 Car position: ({centroid.x:.1f}, {centroid.y:.1f})")
+                log_trilateration(f"❌ No valid minimum area triangle found - all triangles intersect distance circles")
+                log_trilateration(f"📊 Statistics: {tested_triangles} triangles tested, {valid_triangles} passed constraints")
+            return None
 
-            return {
-                'position': centroid,
-                'triangle': best_triangle,
-                'car_dimensions': {'length': 30.0, 'width': 16.0},
-                'is_fallback': False,
-                'triangle_distances': [r1, r2, r3]  # Store the exact distances used
-            }
-        else:
-            # Fallback if no valid triangles found
-            if should_log:
-                log_trilateration(f"⚠️ No valid triangles found after testing candidates, using weighted fallback.")
-            
-            total_weight = 0
-            weighted_x = 0
-            weighted_y = 0
-            
-            for pos, radius in circles:
-                weight = 1.0 / max(radius, 1.0)
-                total_weight += weight
-                weighted_x += pos.x * weight
-                weighted_y += pos.y * weight
-            
-            if total_weight > 0:
-                fallback_position = Point2D(weighted_x / total_weight, weighted_y / total_weight)
-            else: # Handle case where all radii are zero
-                fallback_position = Point2D(
-                    (circles[0][0].x + circles[1][0].x + circles[2][0].x) / 3.0,
-                    (circles[0][0].y + circles[1][0].y + circles[2][0].y) / 3.0,
-                )
+        # Calculate car center at triangle centroid
+        car_x = sum(p.x for p in best_triangle) / 3
+        car_y = sum(p.y for p in best_triangle) / 3
+        car_position = Point2D(car_x, car_y)
 
-            if should_log:
-                log_position(f"📍 Fallback position: ({fallback_position.x:.1f}, {fallback_position.y:.1f})")
+        if should_log:
+            log_trilateration(f"✅ Found minimum area triangle: {min_area:.1f}cm² ({valid_triangles} valid candidates)")
+            log_trilateration(f"🚗 Car center: ({car_x:.1f}, {car_y:.1f})")
 
-            return {
-                'position': fallback_position,
-                'triangle': None,
-                'car_dimensions': {'length': 30.0, 'width': 16.0},
-                'is_fallback': True
-            }
+        return {
+            'position': car_position,
+            'triangle': best_triangle,
+            'car_dimensions': {'length': 30.0, 'width': 16.0}
+        }
+    
+    def _triangle_intersects_circles(self, triangle: List[Point2D], circles: List[Tuple[Point2D, float]]) -> bool:
+        """
+        Check if triangle shares any common area with distance circles.
+        Only checks edge intersections - triangles with vertices on circle perimeters 
+        are valid as long as edges don't intersect circle interiors.
+        """
+        # Check if any triangle edge intersects any circle
+        for i in range(3):
+            p1 = triangle[i]
+            p2 = triangle[(i + 1) % 3]
+            
+            for center, radius in circles:
+                if self._line_intersects_circle(p1, p2, center, radius):
+                    return True
+        
+        return False
+    
+    def _is_valid_car_position(self, triangle: List[Point2D], circles: List[Tuple[Point2D, float]]) -> bool:
+        """Check if triangle centroid represents a valid car center position"""
+        import math
+        
+        # Calculate triangle centroid (potential car center)
+        centroid_x = sum(p.x for p in triangle) / 3
+        centroid_y = sum(p.y for p in triangle) / 3
+        car_center = Point2D(centroid_x, centroid_y)
+        
+        # Car dimensions - diagonal radius (from center to corner)
+        car_length = 30.0  # cm
+        car_width = 16.0   # cm 
+        car_radius = math.sqrt((car_length/2)**2 + (car_width/2)**2)  # ≈ 18cm
+        
+        # CORRECT CONSTRAINT: Car center must be positioned such that 
+        # car edge can reach the measured distance to each sensor
+        # Formula: distance(car_center, sensor) + car_radius ≤ measured_distance
+        
+        for i, (sensor_pos, measured_distance) in enumerate(circles):
+            distance_to_sensor = car_center.distance_to(sensor_pos)
+            
+            # Check if car edge can reach the measured distance
+            if distance_to_sensor + car_radius > measured_distance:
+                # Debug: Log why this position is invalid
+                from .logging_config import log_trilateration
+                log_trilateration(f"   ❌ Sensor {i+1}: car_center_dist({distance_to_sensor:.1f}) + car_radius({car_radius:.1f}) = {distance_to_sensor + car_radius:.1f} > measured({measured_distance:.1f})")
+                return False  # Car is too far from sensor
+            
+            # Also check if car is not too close (some minimum distance)
+            if distance_to_sensor < car_radius * 0.1:  # At least 10% of car radius away
+                from .logging_config import log_trilateration
+                log_trilateration(f"   ❌ Sensor {i+1}: car too close - distance({distance_to_sensor:.1f}) < min({car_radius * 0.1:.1f})")
+                return False  # Car center too close to sensor
+        
+        return True
+    
+    def _line_intersects_circle(self, p1: Point2D, p2: Point2D, center: Point2D, radius: float) -> bool:
+        """Check if line segment intersects circle"""
+        # Vector from p1 to p2
+        dx = p2.x - p1.x
+        dy = p2.y - p1.y
+        
+        # Vector from p1 to circle center
+        fx = p1.x - center.x
+        fy = p1.y - center.y
+        
+        # Quadratic equation coefficients
+        a = dx * dx + dy * dy
+        b = 2 * (fx * dx + fy * dy)
+        c = (fx * fx + fy * fy) - radius * radius
+        
+        discriminant = b * b - 4 * a * c
+        if discriminant < 0:
+            return False  # No intersection
+        
+        # Check if intersection points are on the line segment
+        sqrt_discriminant = math.sqrt(discriminant)
+        t1 = (-b - sqrt_discriminant) / (2 * a)
+        t2 = (-b + sqrt_discriminant) / (2 * a)
+        
+        return (0 <= t1 <= 1) or (0 <= t2 <= 1)
 
     def _triangle_area_precise(self, p1: Point2D, p2: Point2D, p3: Point2D) -> float:
         """
@@ -1384,8 +1511,9 @@ class SimulationPage:
     def _validate_triangle_exterior(self, triangle: Tuple[Point2D, Point2D, Point2D], 
                                   circles: List[Tuple[Point2D, float]], tolerance: float) -> bool:
         """
-        Correctly validates that a vertex from one circle is not inside any of the OTHER circles.
-        Also includes additional verification that vertices are actually ON their respective perimeters.
+        Enhanced validation that a vertex from one circle is not inside any of the OTHER circles.
+        Also includes strict verification that vertices are actually ON their respective perimeters
+        and the triangle is geometrically reasonable.
         """
         pt1, pt2, pt3 = triangle
         (c1, r1), (c2, r2), (c3, r3) = circles
@@ -1395,11 +1523,31 @@ class SimulationPage:
         dist2_to_c2 = pt2.distance_to(c2)
         dist3_to_c3 = pt3.distance_to(c3)
         
-        # Use much stricter tolerance for perimeter verification (1e-5)
-        perimeter_tolerance = 1e-5
+        # Use much stricter tolerance for perimeter verification (1e-6 instead of 1e-5)
+        perimeter_tolerance = 1e-6
         if (abs(dist1_to_c1 - r1) > perimeter_tolerance or 
             abs(dist2_to_c2 - r2) > perimeter_tolerance or 
             abs(dist3_to_c3 - r3) > perimeter_tolerance):
+            return False
+
+        # Additional geometric validation: check triangle area and side lengths
+        area = self._triangle_area_precise(pt1, pt2, pt3)
+        side1 = pt1.distance_to(pt2)
+        side2 = pt2.distance_to(pt3)
+        side3 = pt3.distance_to(pt1)
+        
+        # Reject triangles that are too large relative to the grid
+        max_reasonable_area = (self.grid_range_x * self.grid_range_y) * 0.3  # Max 30% of grid area
+        if area > max_reasonable_area:
+            return False
+            
+        # Reject very thin triangles (degenerate cases)
+        min_side_length = 5.0  # cm - minimum meaningful side length
+        if side1 < min_side_length or side2 < min_side_length or side3 < min_side_length:
+            return False
+            
+        # Check triangle inequality (basic geometric validity)
+        if (side1 + side2 <= side3 or side2 + side3 <= side1 or side1 + side3 <= side2):
             return False
 
         # Original validation: vertex from one circle cannot be inside the OTHER circles
@@ -1432,9 +1580,9 @@ class SimulationPage:
         should_debug = not hasattr(self, '_last_draw_debug') or current_time - self._last_draw_debug > 3000
         if should_debug:
             self._last_draw_debug = current_time
-            log_trilateration(f"🎨 Drawing Debug:")
-            log_trilateration(f"   Grid origin: ({self.grid_origin.x:.1f}, {self.grid_origin.y:.1f})")
-            log_trilateration(f"   Scale factors: X={self.pixels_per_cm_x:.3f}, Y={self.pixels_per_cm_y:.3f}")
+            # log_trilateration(f"🎨 Drawing Debug:")
+            # log_trilateration(f"   Grid origin: ({self.grid_origin.x:.1f}, {self.grid_origin.y:.1f})")
+            # log_trilateration(f"   Scale factors: X={self.pixels_per_cm_x:.3f}, Y={self.pixels_per_cm_y:.3f}")
         
         # FIXED: Use exact same coordinate conversion as sensor nodes and circles
         points = []
@@ -1464,18 +1612,26 @@ class SimulationPage:
                 error_2 = abs(actual_dist_2 - r2)
                 error_3 = abs(actual_dist_3 - r3)
                 
-                log_trilateration(f"🔍 PERIMETER VERIFICATION (using generation distances):")
-                log_trilateration(f"   P1: Expected r={r1:.3f}, Actual d={actual_dist_1:.3f}, Error={error_1:.6f}")
-                log_trilateration(f"   P2: Expected r={r2:.3f}, Actual d={actual_dist_2:.3f}, Error={error_2:.6f}")
-                log_trilateration(f"   P3: Expected r={r3:.3f}, Actual d={actual_dist_3:.3f}, Error={error_3:.6f}")
+                # Only log triangle validation details every few seconds to reduce spam
+                current_time = pygame.time.get_ticks()
+                should_log_validation = current_time - self.last_triangle_validation_log > self.triangle_validation_log_interval
                 
-                # Flag vertices that are significantly off the perimeter (should be < 1e-5)
-                if error_1 > 1e-3:
-                    log_trilateration(f"❌ MAJOR ERROR: P1 not on circle perimeter! Error: {error_1:.6f}")
-                if error_2 > 1e-3:
-                    log_trilateration(f"❌ MAJOR ERROR: P2 not on circle perimeter! Error: {error_2:.6f}")
-                if error_3 > 1e-3:
-                    log_trilateration(f"❌ MAJOR ERROR: P3 not on circle perimeter! Error: {error_3:.6f}")
+                if should_log_validation:
+                    self.last_triangle_validation_log = current_time
+                    # log_trilateration(f"🔍 PERIMETER VERIFICATION (using generation distances):")
+                    # log_trilateration(f"   P1: Expected r={r1:.3f}, Actual d={actual_dist_1:.3f}, Error={error_1:.6f}")
+                    # log_trilateration(f"   P2: Expected r={r2:.3f}, Actual d={actual_dist_2:.3f}, Error={error_2:.6f}")
+                    # log_trilateration(f"   P3: Expected r={r3:.3f}, Actual d={actual_dist_3:.3f}, Error={error_3:.6f}")
+                
+                # Only log major errors (not every frame)
+                if should_log_validation:
+                    # Flag vertices that are significantly off the perimeter (should be < 1e-5)
+                    if error_1 > 1e-3:
+                        log_trilateration(f"❌ MAJOR ERROR: P1 not on circle perimeter! Error: {error_1:.6f}")
+                    if error_2 > 1e-3:
+                        log_trilateration(f"❌ MAJOR ERROR: P2 not on circle perimeter! Error: {error_2:.6f}")
+                    if error_3 > 1e-3:
+                        log_trilateration(f"❌ MAJOR ERROR: P3 not on circle perimeter! Error: {error_3:.6f}")
                 distances = []
                 for node in sensor_list:
                     if self.demo_moving_object['enabled'] and self.demo_moving_object['distance_mode'] == 'manual':
@@ -1490,9 +1646,12 @@ class SimulationPage:
                     d1 = p1.distance_to(sensor_list[0].position)
                     d2 = p2.distance_to(sensor_list[1].position)
                     d3 = p3.distance_to(sensor_list[2].position)
-                    log_trilateration(f"   Vertex verification: P1→S1={d1:.1f}cm (expected {distances[0]:.1f})")
-                    log_trilateration(f"                         P2→S2={d2:.1f}cm (expected {distances[1]:.1f})")
-                    log_trilateration(f"                         P3→S3={d3:.1f}cm (expected {distances[2]:.1f})")
+                    
+                    # Only log vertex verification occasionally
+                    if should_log_validation:
+                        log_trilateration(f"   Vertex verification: P1→S1={d1:.1f}cm (expected {distances[0]:.1f})")
+                        log_trilateration(f"                         P2→S2={d2:.1f}cm (expected {distances[1]:.1f})")
+                        log_trilateration(f"                         P3→S3={d3:.1f}cm (expected {distances[2]:.1f})")
         
         if len(points) >= 3:
             p1, p2, p3 = triangle[:3]
@@ -1741,6 +1900,9 @@ class SimulationPage:
                         elif key == 'show_tracing':
                             self.show_tracing = not self.show_tracing
                             self.visualization_settings['show_tracing'] = self.show_tracing
+                        elif key == 'show_spatial_audio':
+                            self.show_spatial_audio = not self.show_spatial_audio
+                            self.visualization_settings['show_spatial_audio'] = self.show_spatial_audio
                         return
                 
                 if 'refresh_trace' in self.button_rects and self.button_rects['refresh_trace'].collidepoint(event.pos):
@@ -2010,6 +2172,130 @@ class SimulationPage:
         if self.demo_moving_object['enabled']:
             pass
     
+    def calculate_spatial_audio_parameters(self, car_center: Point2D, orientation: float) -> Dict:
+        """Calculate spatial audio parameters for left and right ears based on car position and orientation"""
+        if not car_center:
+            return {}
+        
+        # Get current orientation
+        current_orientation = self.demo_moving_object['orientation'] if self.demo_moving_object['enabled'] else self.moving_object_orientation
+        
+        # Calculate ear positions
+        ear_positions = self._calculate_ear_positions(car_center, current_orientation)
+        left_ear = ear_positions['left_ear']
+        right_ear = ear_positions['right_ear']
+        
+        # Get sensor devices for audio synthesis
+        sensor_devices = [device for device in self.device_manager.devices.values() 
+                          if device.device_type != "moving_object"]
+        
+        spatial_params = {
+            'left_ear_position': left_ear,
+            'right_ear_position': right_ear,
+            'sensor_audio_data': {}
+        }
+        
+        for device in sensor_devices:
+            if device.device_name in self.sensor_nodes:
+                sensor_node = self.sensor_nodes[device.device_name]
+                sensor_pos = sensor_node.position
+                
+                # Calculate distances from each ear to sensor
+                left_distance = left_ear.distance_to(sensor_pos)
+                right_distance = right_ear.distance_to(sensor_pos)
+                
+                # Analyze line-of-sight for both ears
+                left_status = self._analyze_line_of_sight(left_ear, sensor_pos, car_center, current_orientation)
+                right_status = self._analyze_line_of_sight(right_ear, sensor_pos, car_center, current_orientation)
+                
+                # Calculate volume levels based on distance and occlusion
+                # Base volume decreases with distance (inverse square law)
+                max_distance = 200.0  # cm
+                left_base_volume = max(0.1, 1.0 - (left_distance / max_distance))
+                right_base_volume = max(0.1, 1.0 - (right_distance / max_distance))
+                
+                # Apply muffling effect (reduce volume by 60% if muffled)
+                left_volume = left_base_volume * (0.4 if left_status == "MUFFLED" else 1.0)
+                right_volume = right_base_volume * (0.4 if right_status == "MUFFLED" else 1.0)
+                
+                # Calculate frequency shift based on distance (Doppler effect simulation)
+                # Closer sounds are slightly higher pitched, farther sounds slightly lower
+                base_frequency = 440.0  # Hz
+                left_frequency = base_frequency * (1.0 + (100.0 - left_distance) / 1000.0)
+                right_frequency = base_frequency * (1.0 + (100.0 - right_distance) / 1000.0)
+                
+                spatial_params['sensor_audio_data'][device.device_name] = {
+                    'left_ear': {
+                        'distance': left_distance,
+                        'volume': left_volume,
+                        'frequency': left_frequency,
+                        'status': left_status
+                    },
+                    'right_ear': {
+                        'distance': right_distance,
+                        'volume': right_volume,
+                        'frequency': right_frequency,
+                        'status': right_status
+                    }
+                }
+        
+        return spatial_params
+    
+    def apply_spatial_audio_synthesis(self, car_center: Point2D, orientation: float):
+        """Apply spatial audio synthesis to the audio engine based on car position and orientation"""
+        if not self.audio_engine or not car_center:
+            return
+        
+        # Get spatial audio parameters
+        spatial_params = self.calculate_spatial_audio_parameters(car_center, orientation)
+        
+        if not spatial_params.get('sensor_audio_data'):
+            return
+        
+        # Apply spatial audio parameters to each sensor device
+        for device_name, audio_data in spatial_params['sensor_audio_data'].items():
+            left_data = audio_data['left_ear']
+            right_data = audio_data['right_ear']
+            
+            # Calculate stereo panning (0.0 = left ear only, 1.0 = right ear only, 0.5 = center)
+            total_volume = left_data['volume'] + right_data['volume']
+            if total_volume > 0:
+                pan = right_data['volume'] / total_volume
+                combined_volume = total_volume / 2  # Average volume
+                
+                # Use average frequency weighted by volume
+                if left_data['volume'] + right_data['volume'] > 0:
+                    combined_frequency = (left_data['frequency'] * left_data['volume'] + 
+                                        right_data['frequency'] * right_data['volume']) / total_volume
+                else:
+                    combined_frequency = 440.0
+                
+                # Apply spatial audio to the device (if audio engine supports it)
+                # For now, we'll use the combined values - future enhancement can add true stereo support
+                try:
+                    # Check if device exists in the device manager and has audio
+                    if device_name in [d.device_name for d in self.device_manager.devices.values()]:
+                        # Log spatial audio data for debugging
+                        from .logging_config import log_audio
+                        log_audio(f"🎵 Spatial Audio - {device_name}: "
+                                f"L:{left_data['status']} {left_data['volume']:.2f}vol, "
+                                f"R:{right_data['status']} {right_data['volume']:.2f}vol, "
+                                f"Pan:{pan:.2f}, Freq:{combined_frequency:.1f}Hz")
+                        
+                        # Apply the calculated audio parameters
+                        # Note: Current audio engine doesn't have stereo support, so we use combined values
+                        self.audio_engine.synthesize_audio(
+                            device_id=device_name,
+                            frequency=combined_frequency,
+                            volume=combined_volume,
+                            duration=0.1  # Short duration for real-time updates
+                        )
+                except Exception as e:
+                    from .logging_config import log_error
+                    log_error(f"❌ Error applying spatial audio for {device_name}: {e}")
+        
+        return spatial_params
+
     def update_settings(self, distance_settings: Dict):
         """Update grid settings"""
         self.max_distance = distance_settings.get('max_distance', 200)

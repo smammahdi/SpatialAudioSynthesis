@@ -564,7 +564,6 @@ class DeviceManager:
                     json_data = json.loads(data)
                     if 'distance' in json_data:
                         distance = float(json_data['distance'])
-                        print(f"📊 Parsed JSON distance from {device_name}: {distance}cm")
                 except Exception as e:
                     print(f"⚠️  JSON parsing failed for {device_name}: {e}")
             
@@ -574,7 +573,6 @@ class DeviceManager:
                     # Clean up the string - remove whitespace and try to parse
                     clean_data = data.strip()
                     distance = float(clean_data)
-                    print(f"📊 Parsed simple distance from {device_name}: {distance}cm")
                 except ValueError as e:
                     print(f"⚠️  Simple parsing failed for {device_name} '{clean_data}': {e}")
                     
@@ -584,21 +582,26 @@ class DeviceManager:
                             parts = data.split(':')
                             if len(parts) > 1:
                                 distance = float(parts[1].strip())
-                                print(f"📊 Parsed colon-separated distance from {device_name}: {distance}cm")
                         except ValueError as e:
                             print(f"⚠️  Colon parsing failed for {device_name}: {e}")
                     elif 'cm' in data.lower():
                         try:
                             distance = float(data.lower().replace('cm', '').strip())
-                            print(f"📊 Parsed cm-suffixed distance from {device_name}: {distance}cm")
                         except ValueError as e:
                             print(f"⚠️  CM parsing failed for {device_name}: {e}")
             
             # Validate distance range (ATmega32A sends 1-200cm based on code)
             if distance is not None:
                 if 1.0 <= distance <= 400.0:  # Valid range
+                    # Check if distance actually changed before logging
+                    device = self.devices.get(device_id)
+                    previous_distance = device.last_distance if device else None
+                    
                     self._update_device_distance(device_id, distance)
-                    print(f"✅ Valid distance from {device_name}: {distance}cm")
+                    
+                    # Only log if distance changed significantly (more than 0.5cm)
+                    if previous_distance is None or abs(distance - previous_distance) > 0.5:
+                        print(f"✅ Distance change for {device_name}: {distance}cm (prev: {previous_distance}cm)")
                 else:
                     print(f"⚠️  Distance out of range from {device_name}: {distance}cm (expected 1-400cm)")
                     # Log error but continue - don't crash the app
@@ -935,8 +938,12 @@ class DeviceManager:
                 self.on_distance_update(device_id, distance)
 
     def disconnect_device(self, device_id: str):
-        """Disconnect a device"""
-        if device_id in self.devices:
+        """Disconnect a device with enhanced error handling"""
+        if device_id not in self.devices:
+            print(f"⚠️  Device {device_id} not found in connected devices")
+            return False
+            
+        try:
             device = self.devices.pop(device_id)
             device.status = DeviceStatus.DISCONNECTED
             
@@ -944,14 +951,26 @@ class DeviceManager:
             if device_id in self.bluetooth_clients:
                 client = self.bluetooth_clients.pop(device_id)
                 if self.loop and BLUETOOTH_LIBRARY == "bleak":
-                    asyncio.run_coroutine_threadsafe(
-                        self._disconnect_ble_client(client), self.loop
-                    )
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            self._disconnect_ble_client(client), self.loop
+                        )
+                    except Exception as ble_error:
+                        print(f"⚠️  BLE cleanup error for {device.device_name}: {ble_error}")
             
+            # Trigger disconnection callback
             if self.on_device_disconnected:
-                self.on_device_disconnected(device_id)
+                try:
+                    self.on_device_disconnected(device_id)
+                except Exception as callback_error:
+                    print(f"⚠️  Disconnect callback error: {callback_error}")
             
             print(f"🔌 Disconnected: {device.device_name}")
+            return True
+            
+        except Exception as e:
+            print(f"🚨 Error disconnecting device {device_id}: {e}")
+            return False
 
     async def _disconnect_ble_client(self, client):
         """Safely disconnect BLE client"""
@@ -1031,18 +1050,31 @@ class DeviceManager:
             device_id = max(self.demo_devices.keys())  # Get the highest numbered device
         
         if device_id not in self.demo_devices:
-            print(f"❌ Demo device {device_id} not found")
+            print(f"⚠️  Demo device {device_id} not found")
             return False
         
-        demo_device = self.demo_devices[device_id]
-        device_name = demo_device.device_name
-        
-        # Remove from collections
-        self.demo_devices.pop(device_id, None)
-        self.disconnect_device(device_id)  # This removes from main devices collection
-        
-        print(f"✅ Removed demo device: {device_name}")
-        return True
+        try:
+            demo_device = self.demo_devices[device_id]
+            device_name = demo_device.device_name
+            
+            # Remove from collections with proper cleanup
+            self.demo_devices.pop(device_id, None)
+            
+            # Also remove from main devices collection if it exists there
+            disconnect_success = True
+            if device_id in self.devices:
+                disconnect_success = self.disconnect_device(device_id)
+            
+            if disconnect_success:
+                print(f"✅ Removed demo device: {device_name}")
+                return True
+            else:
+                print(f"⚠️  Demo device {device_name} removed from demo collection but disconnect failed")
+                return False
+                
+        except Exception as e:
+            print(f"🚨 Error removing demo device {device_id}: {e}")
+            return False
 
     def clear_all_demo_devices(self):
         """Remove all demo devices"""

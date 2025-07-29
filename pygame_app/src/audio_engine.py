@@ -48,6 +48,9 @@ class AudioChannel:
     is_enabled: bool = True
     # New fields for play-to-completion logic
     audio_start_time: float = 0.0
+    # Spatial audio fields
+    left_volume: float = 1.0
+    right_volume: float = 1.0
     audio_duration: float = 0.0
     pending_volume: Optional[float] = None
     pending_frequency: Optional[float] = None
@@ -660,6 +663,188 @@ class SpatialAudioEngine:
         """Get the audio source assigned to a device"""
         channel = self.channels.get(device_id)
         return channel.audio_source if channel else None
+    
+    def synthesize_spatial_audio(self, device_id: str, car_position: Tuple[float, float], 
+                                car_orientation: float, sensor_positions: List[Tuple[float, float]], 
+                                distances: List[float], volume: float = 0.5) -> bool:
+        """
+        Generate spatial audio for left and right ears based on car position and orientation.
+        
+        Args:
+            device_id: ID of the device playing audio
+            car_position: (x, y) position of car center
+            car_orientation: Car orientation in radians (0 = facing right)
+            sensor_positions: List of (x, y) positions of sensors
+            distances: List of distances from sensors
+            volume: Base volume level
+        """
+        try:
+            if device_id not in self.channels:
+                return False
+                
+            channel = self.channels[device_id]
+            if not channel.is_enabled or not channel.is_playing:
+                return False
+            
+            # Calculate left and right ear positions
+            car_x, car_y = car_position
+            
+            # Ear positions are at the front half of the car (upper half based on orientation)
+            # Distance from center to ear position (half car width)
+            ear_offset = 8.0  # cm (half of 16cm car width)
+            
+            # Calculate perpendicular direction to car orientation for left/right ears
+            left_ear_angle = car_orientation + np.pi/2  # 90 degrees left of car direction
+            right_ear_angle = car_orientation - np.pi/2  # 90 degrees right of car direction
+            
+            left_ear_x = car_x + ear_offset * np.cos(left_ear_angle)
+            left_ear_y = car_y + ear_offset * np.sin(left_ear_angle)
+            
+            right_ear_x = car_x + ear_offset * np.cos(right_ear_angle)
+            right_ear_y = car_y + ear_offset * np.sin(right_ear_angle)
+            
+            # For each sensor, determine if sound is clear or muffled for each ear
+            left_volumes = []
+            right_volumes = []
+            
+            for i, (sensor_x, sensor_y) in enumerate(sensor_positions):
+                sensor_distance = distances[i]
+                
+                # Check line-of-sight from each ear to sensor
+                left_clear = self._is_line_of_sight_clear(
+                    (left_ear_x, left_ear_y), (sensor_x, sensor_y), car_position, car_orientation
+                )
+                right_clear = self._is_line_of_sight_clear(
+                    (right_ear_x, right_ear_y), (sensor_x, sensor_y), car_position, car_orientation
+                )
+                
+                # Calculate distance-based volume
+                base_volume = volume / (1 + sensor_distance / 100.0)  # Fade with distance
+                
+                # Apply muffling if blocked by car body
+                left_vol = base_volume if left_clear else base_volume * 0.3  # Muffled
+                right_vol = base_volume if right_clear else base_volume * 0.3  # Muffled
+                
+                left_volumes.append(left_vol)
+                right_volumes.append(right_vol)
+            
+            # Combine volumes from all sensors
+            total_left_volume = min(1.0, sum(left_volumes))
+            total_right_volume = min(1.0, sum(right_volumes))
+            
+            # Update channel with spatial audio parameters
+            channel.left_volume = total_left_volume
+            channel.right_volume = total_right_volume
+            channel.current_volume = max(total_left_volume, total_right_volume)
+            
+            log_audio(f"🎵 Spatial audio for {device_id}: L={total_left_volume:.2f}, R={total_right_volume:.2f}")
+            return True
+            
+        except Exception as e:
+            log_error(f"Spatial audio synthesis error for {device_id}: {e}")
+            return False
+    
+    def _is_line_of_sight_clear(self, ear_pos: Tuple[float, float], sensor_pos: Tuple[float, float], 
+                               car_center: Tuple[float, float], car_orientation: float) -> bool:
+        """
+        Check if there's a clear line of sight from ear to sensor (not blocked by car body).
+        
+        Args:
+            ear_pos: (x, y) position of ear
+            sensor_pos: (x, y) position of sensor
+            car_center: (x, y) position of car center
+            car_orientation: Car orientation in radians
+        """
+        try:
+            import math
+            
+            ear_x, ear_y = ear_pos
+            sensor_x, sensor_y = sensor_pos
+            car_x, car_y = car_center
+            
+            # Define car body as rectangle
+            car_length = 30.0  # cm
+            car_width = 16.0   # cm
+            
+            # Calculate car corner positions based on orientation
+            half_length = car_length / 2
+            half_width = car_width / 2
+            
+            # Car corners in local coordinates (relative to center)
+            corners_local = [
+                (-half_length, -half_width),  # Back left
+                (-half_length, half_width),   # Back right
+                (half_length, half_width),    # Front right
+                (half_length, -half_width)    # Front left
+            ]
+            
+            # Rotate corners based on car orientation
+            cos_angle = math.cos(car_orientation)
+            sin_angle = math.sin(car_orientation)
+            
+            car_corners = []
+            for local_x, local_y in corners_local:
+                # Rotate and translate to world coordinates
+                world_x = car_x + local_x * cos_angle - local_y * sin_angle
+                world_y = car_y + local_x * sin_angle + local_y * cos_angle
+                car_corners.append((world_x, world_y))
+            
+            # Check if line from ear to sensor intersects car body rectangle
+            return not self._line_intersects_rectangle(ear_pos, sensor_pos, car_corners)
+            
+        except Exception as e:
+            log_error(f"Line of sight calculation error: {e}")
+            return True  # Default to clear if calculation fails
+    
+    def _line_intersects_rectangle(self, line_start: Tuple[float, float], 
+                                  line_end: Tuple[float, float], 
+                                  rect_corners: List[Tuple[float, float]]) -> bool:
+        """Check if a line segment intersects with a rectangle defined by corners."""
+        try:
+            # Check intersection with each edge of the rectangle
+            for i in range(4):
+                edge_start = rect_corners[i]
+                edge_end = rect_corners[(i + 1) % 4]
+                
+                if self._line_segments_intersect(line_start, line_end, edge_start, edge_end):
+                    return True
+            
+            return False
+            
+        except Exception as e:
+            log_error(f"Line-rectangle intersection error: {e}")
+            return False
+    
+    def _line_segments_intersect(self, p1: Tuple[float, float], p2: Tuple[float, float],
+                                p3: Tuple[float, float], p4: Tuple[float, float]) -> bool:
+        """Check if two line segments intersect."""
+        try:
+            x1, y1 = p1
+            x2, y2 = p2
+            x3, y3 = p3
+            x4, y4 = p4
+            
+            # Calculate the direction vectors
+            d1 = ((x2 - x1), (y2 - y1))
+            d2 = ((x4 - x3), (y4 - y3))
+            d3 = ((x1 - x3), (y1 - y3))
+            
+            # Calculate cross products
+            cross_d1_d2 = d1[0] * d2[1] - d1[1] * d2[0]
+            
+            if abs(cross_d1_d2) < 1e-10:
+                return False  # Lines are parallel
+            
+            # Calculate intersection parameters
+            t1 = (d3[0] * d2[1] - d3[1] * d2[0]) / cross_d1_d2
+            t2 = (d3[0] * d1[1] - d3[1] * d1[0]) / cross_d1_d2
+            
+            # Check if intersection point is within both line segments
+            return 0 <= t1 <= 1 and 0 <= t2 <= 1
+            
+        except Exception as e:
+            log_error(f"Line segment intersection error: {e}")
+            return False
         
     def set_master_volume(self, volume: float):
         """Set master volume (0.0 to 1.0)"""
