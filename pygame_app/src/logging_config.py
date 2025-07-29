@@ -33,7 +33,7 @@ DEMO_LOGS = False               # Demo mode controls, demo object movement
 # System & Error Logs
 SYSTEM_LOGS = False             # System initialization, cleanup, general status
 ERROR_LOGS = True               # Error messages and exceptions (always useful)
-DEBUG_LOGS = False              # Detailed debugging information
+DEBUG_LOGS = True               # Detailed debugging information
 
 # File & Configuration Logs
 FILE_LOGS = False               # File operations, loading, saving
