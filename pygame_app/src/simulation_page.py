@@ -457,7 +457,7 @@ class SimulationPage:
             mini_size = (int(original_size[0] * mini_scale), int(original_size[1] * mini_scale))
             mini_car = pygame.transform.scale(self.car_image, mini_size)
             
-            rotated_car = pygame.transform.rotate(mini_car, -orientation)
+            rotated_car = pygame.transform.rotate(mini_car, orientation)
             
             car_rect = rotated_car.get_rect()
             car_rect.center = (center_x, center_y)
@@ -478,7 +478,7 @@ class SimulationPage:
                             (car_width - 5, car_height // 2 + 4)]
             pygame.draw.polygon(car_surface, (255, 217, 61), front_points)
             
-            rotated_car = pygame.transform.rotate(car_surface, -orientation)
+            rotated_car = pygame.transform.rotate(car_surface, orientation)
             
             car_rect = rotated_car.get_rect(center=(center_x, center_y))
             
@@ -607,7 +607,7 @@ class SimulationPage:
                         )
                 
                 # Only update position trace when we have a valid triangle (not fallback)
-                if not trilateration_result.get('is_fallback', False):
+                if not trilateration_result.get('method') == 'circle_intersection':
                     self._update_position_trace(trilateration_result['position'])
                 
                 # Draw position trace if enabled
@@ -1064,7 +1064,7 @@ class SimulationPage:
             scaled_car = pygame.transform.scale(self.car_image, scaled_size)
             
             # Rotate the car image
-            rotated_car = pygame.transform.rotate(scaled_car, -current_orientation)
+            rotated_car = pygame.transform.rotate(scaled_car, current_orientation)
             
             car_rect = rotated_car.get_rect()
             car_rect.center = (int(center_x), int(center_y))
@@ -1406,6 +1406,13 @@ class SimulationPage:
             if should_log:
                 log_trilateration(f"❌ No valid minimum area triangle found - all triangles intersect distance circles")
                 log_trilateration(f"📊 Statistics: {tested_triangles} triangles tested, {valid_triangles} passed constraints")
+                log_trilateration(f"🔄 Attempting circle intersection fallback method...")
+            
+            # FALLBACK: Try circle intersection approach for overlapping circles
+            fallback_result = self._circle_intersection_fallback(c1, r1, c2, r2, c3, r3, should_log)
+            if fallback_result:
+                return fallback_result
+            
             return None
 
         # Calculate car center at triangle centroid
@@ -1507,6 +1514,116 @@ class SimulationPage:
         Calculates triangle area using the shoelace formula for numerical stability.
         """
         return abs((p1.x * (p2.y - p3.y) + p2.x * (p3.y - p1.y) + p3.x * (p1.y - p2.y)) / 2.0)
+
+    def _circle_intersection_fallback(self, c1: Point2D, r1: float, c2: Point2D, r2: float, 
+                                    c3: Point2D, r3: float, should_log: bool = False) -> Optional[Dict]:
+        """
+        Fallback method for when circles have overlapping regions.
+        Finds intersection points between each pair of circles and uses their centroid as car position.
+        
+        This handles real-world scenarios where distance circles overlap significantly.
+        """
+        from .logging_config import log_trilateration
+        
+        if should_log:
+            log_trilateration(f"🔄 Circle Intersection Fallback - finding intersection points")
+        
+        # Find intersection points between each pair of circles
+        intersections = []
+        
+        # Intersection of circle 1 and 2
+        int_12 = self._find_circle_intersection_points(c1, r1, c2, r2)
+        if int_12:
+            intersections.extend(int_12)
+            if should_log:
+                log_trilateration(f"   📍 C1-C2 intersection: {len(int_12)} points")
+        
+        # Intersection of circle 1 and 3
+        int_13 = self._find_circle_intersection_points(c1, r1, c3, r3)
+        if int_13:
+            intersections.extend(int_13)
+            if should_log:
+                log_trilateration(f"   📍 C1-C3 intersection: {len(int_13)} points")
+        
+        # Intersection of circle 2 and 3
+        int_23 = self._find_circle_intersection_points(c2, r2, c3, r3)
+        if int_23:
+            intersections.extend(int_23)
+            if should_log:
+                log_trilateration(f"   📍 C2-C3 intersection: {len(int_23)} points")
+        
+        if len(intersections) < 3:
+            if should_log:
+                log_trilateration(f"❌ Insufficient intersection points: {len(intersections)} (need at least 3)")
+            return None
+        
+        # Take the first intersection point from each pair to form a triangle
+        # This gives us a representative triangle in the common intersection region
+        triangle_points = []
+        if int_12:
+            triangle_points.append(int_12[0])
+        if int_13:
+            triangle_points.append(int_13[0])
+        if int_23:
+            triangle_points.append(int_23[0])
+        
+        if len(triangle_points) < 3:
+            # If we don't have one from each pair, use the first 3 intersection points
+            triangle_points = intersections[:3]
+        
+        # Calculate centroid of intersection triangle
+        car_x = sum(p.x for p in triangle_points) / len(triangle_points)
+        car_y = sum(p.y for p in triangle_points) / len(triangle_points)
+        car_position = Point2D(car_x, car_y)
+        
+        if should_log:
+            log_trilateration(f"✅ Circle intersection fallback successful")
+            log_trilateration(f"🚗 Car center from intersection centroid: ({car_x:.1f}, {car_y:.1f})")
+        
+        return {
+            'position': car_position,
+            'triangle': triangle_points,  # The intersection points forming the triangle
+            'car_dimensions': {'length': 30.0, 'width': 16.0},
+            'method': 'circle_intersection'  # Flag to indicate this was from fallback
+        }
+
+    def _find_circle_intersection_points(self, c1: Point2D, r1: float, c2: Point2D, r2: float) -> List[Point2D]:
+        """
+        Find intersection points between two circles.
+        Returns up to 2 intersection points.
+        """
+        import math
+        
+        # Distance between circle centers
+        d = c1.distance_to(c2)
+        
+        # Check if circles don't intersect or are identical
+        if d > r1 + r2:  # Too far apart
+            return []
+        if d < abs(r1 - r2):  # One circle inside the other
+            return []
+        if d == 0 and r1 == r2:  # Identical circles
+            return []
+        
+        # Calculate intersection points using geometric formulas
+        a = (r1*r1 - r2*r2 + d*d) / (2*d)
+        h = math.sqrt(r1*r1 - a*a)
+        
+        # Point on line between centers
+        px = c1.x + a * (c2.x - c1.x) / d
+        py = c1.y + a * (c2.y - c1.y) / d
+        
+        # The two intersection points
+        intersection1 = Point2D(
+            px + h * (c2.y - c1.y) / d,
+            py - h * (c2.x - c1.x) / d
+        )
+        intersection2 = Point2D(
+            px - h * (c2.y - c1.y) / d,
+            py + h * (c2.x - c1.x) / d
+        )
+        
+        return [intersection1, intersection2]
 
     def _validate_triangle_exterior(self, triangle: Tuple[Point2D, Point2D, Point2D], 
                                   circles: List[Tuple[Point2D, float]], tolerance: float) -> bool:
@@ -1725,7 +1842,7 @@ class SimulationPage:
             scaled_size = (int(original_size[0] * scale), int(original_size[1] * scale))
             scaled_car = pygame.transform.scale(self.car_image, scaled_size)
             
-            rotated_car = pygame.transform.rotate(scaled_car, -current_orientation)
+            rotated_car = pygame.transform.rotate(scaled_car, current_orientation)
             
             car_rect = rotated_car.get_rect()
             car_rect.center = (int(center_x), int(center_y))
@@ -1787,7 +1904,7 @@ class SimulationPage:
         current_orientation = self.demo_moving_object['enabled'] if self.demo_moving_object['enabled'] else self.moving_object_orientation
         
         if self.car_image:
-            rotated_car = pygame.transform.rotate(self.car_image, -current_orientation)
+            rotated_car = pygame.transform.rotate(self.car_image, current_orientation)
             
             car_rect = rotated_car.get_rect()
             car_rect.center = (int(x), int(y))
